@@ -1,0 +1,21 @@
+services:
+  bot:
+    build: .
+    container_name: tg-claude-runner
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # /home/node hosts CLI credentials & user-installed binaries (gh, aws,
+      # gcloud, .ssh, .gitconfig, .claude/.credentials.json, npm-global, …).
+      # Override CLAUDE_BOT_HOME in .env if you want a different host path.
+      - ${CLAUDE_BOT_HOME:-${HOME}/claude_bot}:/home/node
+      # /workspace is Claude's cwd. Drop CLAUDE.md, .claude/skills, scripts here.
+      - ${CLAUDE_BOT_HOME:-${HOME}/claude_bot}/workspace:/workspace
+      # Bot internal state (jobs.json, etc).
+      - ./data:/app/data
+    networks:
+      - default
+
+networks:
+  default:
+    driver: bridge
