@@ -157,6 +157,15 @@ sudo apt-get install -y postgresql-client redis-tools
 
 Free-text messages are forwarded to Claude with the current session.
 
+## File uploads
+
+Send a document, photo, video, or animation to the bot. The file is saved to `/workspace/inbox/<timestamp>_<filename>` and Claude is asked to process it. The Telegram **caption** of the upload becomes the prompt; without a caption Claude just acknowledges the file and waits.
+
+Notes:
+- Telegram bot API caps file downloads at **20 MB** — larger uploads are rejected with a message.
+- For images, Claude reads them via its Read tool (vision is built into the model).
+- The captioned upload is one Telegram message: send file + caption together. Sending text and file as two separate messages is treated as two unrelated turns.
+
 ## Voice messages (optional)
 
 If `OPENAI_API_KEY` is set in `.env`, voice and audio messages are transcribed via OpenAI Whisper and forwarded to Claude as if you typed them. The bot replies with the transcription (so you can verify) followed by Claude's answer. Without the key, voice messages are silently ignored.

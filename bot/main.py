@@ -7,14 +7,16 @@ import json
 import asyncio
 import logging
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
 
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -35,6 +37,8 @@ WORKSPACE_DIR = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", "/home/node/.claude"))
 CLAUDE_CREDS = CLAUDE_HOME / ".credentials.json"
 JOBS_FILE = DATA_DIR / "jobs.json"
+MODEL_FILE = DATA_DIR / "model.json"
+MODEL_CHOICES = ["default", "sonnet", "opus", "haiku"]
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "180"))
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -47,6 +51,8 @@ else:
     _openai_client = None
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+INBOX_DIR_NAME = "inbox"
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # Telegram bot API limit
 
 _FILE_SEARCH_SYSTEM = (
     "You are a file retrieval assistant for a Telegram bot. "
@@ -80,6 +86,9 @@ class ClaudeRunner:
                 "--output-format", "json",
                 "--dangerously-skip-permissions",
             ]
+            model = load_model()
+            if model != "default":
+                cmd += ["--model", model]
             if session_id:
                 cmd += ["--resume", session_id]
 
@@ -137,6 +146,18 @@ def save_credentials_json(creds_json: str) -> None:
     CLAUDE_CREDS.write_text(creds_json)
     CLAUDE_CREDS.chmod(0o600)
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+
+
+def load_model() -> str:
+    try:
+        return json.loads(MODEL_FILE.read_text()).get("model", "default")
+    except Exception:
+        return "default"
+
+
+def save_model(name: str) -> None:
+    MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MODEL_FILE.write_text(json.dumps({"model": name}))
 
 
 def allowed(update: Update) -> bool:
@@ -235,6 +256,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/login - paste Claude credentials\n"
         "/file <query> - retrieve files matching a query (Claude searches)\n"
         "/get <path> - send a workspace file by path (no Claude)\n"
+        "/model [name] - show or set Claude model\n"
         '/schedule add "<cron>" <prompt> - recurring prompt\n'
         "/schedule list - list jobs\n"
         "/schedule remove <id> - remove job\n"
@@ -283,6 +305,49 @@ async def cmd_login(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    if ctx.args:
+        name = ctx.args[0].strip()
+        if name not in MODEL_CHOICES:
+            await update.message.reply_text(
+                f"Unknown model. Choices: {', '.join(MODEL_CHOICES)}"
+            )
+            return
+        save_model(name)
+        await update.message.reply_text(f"Model set to {name}.")
+        return
+    current = load_model()
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'> ' if c == current else ''}{c}",
+            callback_data=f"model:{c}",
+        )]
+        for c in MODEL_CHOICES
+    ]
+    await update.message.reply_text(
+        f"Current: {current}\nChoose a model:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def on_model_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data or not query.data.startswith("model:"):
+        return
+    if update.effective_user is None or update.effective_user.id != ALLOWED_USER:
+        await query.answer("Not authorized.")
+        return
+    name = query.data.split(":", 1)[1]
+    if name not in MODEL_CHOICES:
+        await query.answer("Invalid model.")
+        return
+    save_model(name)
+    await query.answer(f"Set to {name}")
+    await query.edit_message_text(f"Model set to {name}.")
+
+
 async def cmd_get(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
@@ -317,6 +382,9 @@ async def cmd_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "--output-format", "json",
         "--dangerously-skip-permissions",
     ]
+    model = load_model()
+    if model != "default":
+        cmd += ["--model", model]
     log.info("file-search [isolated] query=%s", query[:200])
 
     await update.message.reply_chat_action("typing")
@@ -451,6 +519,80 @@ async def cmd_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Unknown subcommand: {sub}")
 
 
+def _safe_filename(name: str) -> str:
+    name = (name or "").strip().replace("/", "_").replace("\\", "_")
+    name = re.sub(r"[^\w.\-]", "_", name)
+    return name[:200] or "file"
+
+
+async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    msg = update.message
+
+    obj = None
+    default_ext = ""
+    if msg.document:
+        obj = msg.document
+    elif msg.photo:
+        obj = msg.photo[-1]
+        default_ext = ".jpg"
+    elif msg.video:
+        obj = msg.video
+        default_ext = ".mp4"
+    elif msg.animation:
+        obj = msg.animation
+        default_ext = ".mp4"
+    else:
+        return
+
+    file_size = getattr(obj, "file_size", 0) or 0
+    if file_size > MAX_DOWNLOAD_BYTES:
+        await msg.reply_text(
+            f"File too large ({file_size // (1024 * 1024)} MB). "
+            "Telegram bot API caps downloads at 20 MB."
+        )
+        return
+
+    await msg.reply_chat_action("typing")
+
+    inbox = WORKSPACE_DIR / INBOX_DIR_NAME
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    raw_name = getattr(obj, "file_name", None) or f"{type(obj).__name__.lower()}{default_ext}"
+    safe = _safe_filename(raw_name)
+    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    target = inbox / f"{timestamp}_{safe}"
+
+    try:
+        file = await ctx.bot.get_file(obj.file_id)
+        await file.download_to_drive(custom_path=str(target))
+    except Exception as e:
+        log.exception("Upload download failed")
+        await msg.reply_text(f"Failed to download file: {e}")
+        return
+
+    log.info("Saved upload to %s (%d bytes)", target, file_size)
+
+    if not is_authed():
+        await msg.reply_text(
+            f"File saved to {target}.\nClaude not authenticated; use /login to process it."
+        )
+        return
+
+    caption = (msg.caption or "").strip()
+    if caption:
+        prompt = f"The user uploaded a file at `{target}`.\nCaption: {caption}"
+    else:
+        prompt = (
+            f"The user uploaded a file at `{target}` with no caption. "
+            "Briefly acknowledge what the file is and wait for instructions."
+        )
+
+    resp = await claude.ask(update.effective_user.id, prompt)
+    await reply_md(update, resp)
+
+
 async def _transcribe(audio_path: Path) -> str:
     loop = asyncio.get_running_loop()
 
@@ -535,6 +677,7 @@ async def post_init(app: Application) -> None:
         BotCommand("login", "paste credentials"),
         BotCommand("file", "retrieve files matching a query"),
         BotCommand("get", "send a workspace file by path"),
+        BotCommand("model", "show or set Claude model"),
         BotCommand("schedule", "schedule recurring prompts"),
         BotCommand("help", "list commands"),
     ]
@@ -586,6 +729,8 @@ def main() -> None:
     app.add_handler(CommandHandler("login", cmd_login))
     app.add_handler(CommandHandler("file", cmd_file))
     app.add_handler(CommandHandler("get", cmd_get))
+    app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CallbackQueryHandler(on_model_callback, pattern=r"^model:"))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
 
     if _openai_client is not None:
@@ -593,6 +738,11 @@ def main() -> None:
         log.info("Whisper transcription enabled (model=%s)", WHISPER_MODEL)
     else:
         log.info("Whisper transcription disabled (OPENAI_API_KEY not set)")
+
+    upload_filter = (
+        filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.ANIMATION
+    )
+    app.add_handler(MessageHandler(upload_filter, handle_upload))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
