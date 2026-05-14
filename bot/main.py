@@ -4,6 +4,7 @@
 import os
 import re
 import json
+import time
 import asyncio
 import logging
 import tempfile
@@ -23,7 +24,8 @@ from telegram.ext import (
 
 from .markdown_v2 import to_telegram_markdown, split_for_telegram
 from .scheduler import Scheduler
-from .claude_session import ClaudeSession, ClaudeSessionError
+from .claude_session import ClaudeSession, ClaudeSessionError, ToolUseCallback
+from .transcript import ToolUse
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -87,7 +89,12 @@ class ClaudeRunner:
             if self._main is not None:
                 await self._main.reset()
 
-    async def ask(self, uid: int, text: str) -> str:
+    async def ask(
+        self,
+        uid: int,
+        text: str,
+        on_tool_use: ToolUseCallback | None = None,
+    ) -> str:
         async with self._locks[uid]:
             wanted = self._wanted_model()
             if self._main is None:
@@ -104,7 +111,7 @@ class ClaudeRunner:
 
             log.info("ask: %s", text[:200])
             try:
-                return await self._main.ask(text)
+                return await self._main.ask(text, on_tool_use=on_tool_use)
             except ClaudeSessionError as e:
                 log.error("ClaudeSession error: %s", e)
                 return f"Claude session error: {e}"
@@ -237,6 +244,73 @@ async def reply_md(update: Update, text: str) -> None:
             return
 
 
+def _format_tool(tu: ToolUse) -> str:
+    """Short Telegram-friendly label for a Claude tool_use block."""
+    name = tu.name
+    inp = tu.input or {}
+    if name == "Bash":
+        cmd = (inp.get("command") or "").splitlines()[0][:60]
+        return f"🔧 Bash: {cmd}"
+    if name == "Read":
+        return f"📖 Read {Path(inp.get('file_path', '?')).name}"
+    if name == "Write":
+        return f"✏️ Write {Path(inp.get('file_path', '?')).name}"
+    if name == "Edit":
+        return f"✏️ Edit {Path(inp.get('file_path', '?')).name}"
+    if name == "Glob":
+        return f"🔍 Glob {inp.get('pattern', '?')[:50]}"
+    if name == "Grep":
+        return f"🔍 Grep {inp.get('pattern', '?')[:50]}"
+    if name == "Task":
+        return f"🤖 Subagent: {inp.get('subagent_type', 'task')}"
+    if name == "WebFetch":
+        return f"🌐 Fetch {(inp.get('url') or '')[:50]}"
+    if name == "WebSearch":
+        return f"🔍 Search: {(inp.get('query') or '')[:50]}"
+    if name == "TodoWrite":
+        return "📝 Todos updated"
+    return f"🔧 {name}"
+
+
+async def claude_reply(update: Update, prompt: str) -> None:
+    """Ask Claude while updating a status message with live tool-use progress.
+
+    First edit fires immediately on the first tool; subsequent edits are
+    throttled to one per 1.5s to stay under Telegram's edit_message_text
+    rate limit. The status message is deleted once Claude returns and
+    the full response is sent via reply_md().
+    """
+    uid = update.effective_user.id
+    status = await update.message.reply_text("🤔 thinking…")
+    state = {"last_edit": 0.0}
+
+    async def on_tool(tu: ToolUse) -> None:
+        now = time.monotonic()
+        if state["last_edit"] != 0.0 and now - state["last_edit"] < 1.5:
+            return
+        state["last_edit"] = now
+        try:
+            await status.edit_text(_format_tool(tu))
+        except Exception as e:
+            log.debug("progress edit failed: %s", e)
+
+    try:
+        resp = await claude.ask(uid, prompt, on_tool_use=on_tool)
+    except Exception as e:
+        log.exception("claude_reply: ask failed")
+        try:
+            await status.edit_text(f"Error: {e}")
+        except Exception:
+            pass
+        return
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    await reply_md(update, resp)
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
@@ -273,12 +347,10 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_compact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
-    await update.message.reply_chat_action("typing")
-    resp = await claude.ask(
-        update.effective_user.id,
+    await claude_reply(
+        update,
         "/compact focus: keep important conversation context",
     )
-    await reply_md(update, resp)
 
 
 async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -558,8 +630,7 @@ async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "Briefly acknowledge what the file is and wait for instructions."
         )
 
-    resp = await claude.ask(update.effective_user.id, prompt)
-    await reply_md(update, resp)
+    await claude_reply(update, prompt)
 
 
 async def _transcribe(audio_path: Path) -> str:
@@ -606,9 +677,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Claude not authenticated. Use /login.")
             return
 
-        await update.message.reply_chat_action("typing")
-        resp = await claude.ask(update.effective_user.id, transcribed)
-        await reply_md(update, resp)
+        await claude_reply(update, transcribed)
     finally:
         try:
             tmp_path.unlink()
@@ -633,9 +702,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Claude not authenticated. Use /login.")
         return
 
-    await update.message.reply_chat_action("typing")
-    resp = await claude.ask(update.effective_user.id, text)
-    await reply_md(update, resp)
+    await claude_reply(update, text)
 
 
 async def post_init(app: Application) -> None:

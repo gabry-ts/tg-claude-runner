@@ -18,12 +18,15 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import aiofiles
 import libtmux
 from libtmux.exc import LibTmuxException
 
 from . import transcript
+
+ToolUseCallback = Callable[[transcript.ToolUse], Awaitable[None]]
 from .session_state import (
     SESSION_MAP_FILE,
     clear_session_map,
@@ -324,7 +327,11 @@ class ClaudeSession:
 
         await asyncio.to_thread(_enter)
 
-    async def wait_for_response(self, timeout: float = RESPONSE_TIMEOUT_S) -> str:
+    async def wait_for_response(
+        self,
+        timeout: float = RESPONSE_TIMEOUT_S,
+        on_tool_use: ToolUseCallback | None = None,
+    ) -> str:
         if self._info is None:
             raise ClaudeSessionError("session not started")
         path = self._info.jsonl_path
@@ -340,19 +347,31 @@ class ClaudeSession:
                 async with aiofiles.open(path, "r") as f:
                     await f.seek(self._info.jsonl_offset)
                     while True:
+                        pre_read = await f.tell()
                         line = await f.readline()
                         if not line:
-                            self._info.jsonl_offset = await f.tell()
                             break
+                        if not line.strip():
+                            self._info.jsonl_offset = await f.tell()
+                            continue
                         entry = transcript.parse_line(line)
                         if entry is None:
-                            continue
+                            # likely a partial line still being written —
+                            # rewind so we re-read it whole next poll
+                            await f.seek(pre_read)
+                            break
+                        self._info.jsonl_offset = await f.tell()
                         if transcript.is_assistant(entry):
                             text = transcript.extract_text(entry)
                             if text:
                                 last_text = text
+                            if on_tool_use:
+                                for tu in transcript.extract_tool_uses(entry):
+                                    try:
+                                        await on_tool_use(tu)
+                                    except Exception as e:
+                                        log.debug("on_tool_use callback failed: %s", e)
                             if transcript.is_end_turn(entry):
-                                self._info.jsonl_offset = await f.tell()
                                 return last_text or ""
             except FileNotFoundError:
                 await asyncio.sleep(JSONL_POLL_S)
@@ -369,10 +388,15 @@ class ClaudeSession:
             f"no end_turn within {timeout}s; last text fragment len={len(last_text)}"
         )
 
-    async def ask(self, text: str, timeout: float = RESPONSE_TIMEOUT_S) -> str:
+    async def ask(
+        self,
+        text: str,
+        timeout: float = RESPONSE_TIMEOUT_S,
+        on_tool_use: ToolUseCallback | None = None,
+    ) -> str:
         await self.ensure_started()
         await self.send_prompt(text)
-        return await self.wait_for_response(timeout)
+        return await self.wait_for_response(timeout, on_tool_use=on_tool_use)
 
     async def reset(self) -> None:
         def _kill() -> None:
