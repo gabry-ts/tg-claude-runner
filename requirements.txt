@@ -1,3 +1,5 @@
 python-telegram-bot[job-queue]==21.10
 croniter==2.0.5
 openai>=1.30,<2
+libtmux>=0.40
+aiofiles>=24

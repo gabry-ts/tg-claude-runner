@@ -23,6 +23,7 @@ from telegram.ext import (
 
 from .markdown_v2 import to_telegram_markdown, split_for_telegram
 from .scheduler import Scheduler
+from .claude_session import ClaudeSession, ClaudeSessionError
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -39,7 +40,6 @@ CLAUDE_CREDS = CLAUDE_HOME / ".credentials.json"
 JOBS_FILE = DATA_DIR / "jobs.json"
 MODEL_FILE = DATA_DIR / "model.json"
 MODEL_CHOICES = ["default", "sonnet", "opus", "haiku"]
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "180"))
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
@@ -67,69 +67,68 @@ _FILE_SEARCH_SYSTEM = (
 
 
 class ClaudeRunner:
-    """One lock per user; sessions persist via Claude --resume."""
+    """Single persistent Claude Code window driven via tmux + JSONL.
+
+    Single-user bot: one main session for chat, ephemeral sessions for
+    isolated lookups (see search()). Lock per uid is kept for API
+    compatibility even though we currently only allow ALLOWED_USER.
+    """
 
     def __init__(self) -> None:
         self._locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self._sessions: dict[int, str | None] = {}
+        self._main: ClaudeSession | None = None
 
-    def reset(self, uid: int) -> None:
-        self._sessions[uid] = None
+    def _wanted_model(self) -> str | None:
+        m = load_model()
+        return None if m == "default" else m
+
+    async def reset(self, uid: int) -> None:
+        async with self._locks[uid]:
+            if self._main is not None:
+                await self._main.reset()
 
     async def ask(self, uid: int, text: str) -> str:
         async with self._locks[uid]:
-            session_id = self._sessions.get(uid)
-
-            cmd = [
-                "claude",
-                "-p", text,
-                "--output-format", "json",
-                "--dangerously-skip-permissions",
-            ]
-            model = load_model()
-            if model != "default":
-                cmd += ["--model", model]
-            if session_id:
-                cmd += ["--resume", session_id]
-
-            log.info("claude [%s] cwd=%s", session_id or "new", WORKSPACE_DIR)
-            log.info("prompt: %s", text[:200])
-
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=str(WORKSPACE_DIR),
+            wanted = self._wanted_model()
+            if self._main is None:
+                self._main = ClaudeSession(
+                    cwd=WORKSPACE_DIR, model=wanted, persist_state=True,
                 )
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=CLAUDE_TIMEOUT
+            elif self._main.model != wanted:
+                log.info(
+                    "model switched %s -> %s; resetting session",
+                    self._main.model, wanted,
                 )
-            except asyncio.TimeoutError:
-                proc.kill()
-                return f"Timeout: Claude exceeded {CLAUDE_TIMEOUT}s."
+                await self._main.reset()
+                self._main.set_model(wanted)
 
-            out = stdout.decode(errors="replace")
-            err = stderr.decode(errors="replace")
-
-            log.info(
-                "claude exit=%d stdout=%dB stderr=%dB",
-                proc.returncode, len(out), len(err),
-            )
-            if err:
-                log.error("stderr: %s", err[:500])
-
-            if proc.returncode != 0:
-                msg = err[:500] or out[:500] or "(no output)"
-                return f"Claude error (exit {proc.returncode}): {msg}"
-
+            log.info("ask: %s", text[:200])
             try:
-                data = json.loads(out)
-                if "session_id" in data:
-                    self._sessions[uid] = data["session_id"]
-                return data.get("result", "(empty result)")
-            except json.JSONDecodeError:
-                return out[:4000] or "(empty response)"
+                return await self._main.ask(text)
+            except ClaudeSessionError as e:
+                log.error("ClaudeSession error: %s", e)
+                return f"Claude session error: {e}"
+
+    async def search(self, prompt: str) -> str:
+        """Run an isolated one-shot query in a fresh ephemeral window.
+
+        Used by /file so the search context never pollutes the main chat
+        session. The window is killed after the response.
+        """
+        wanted = self._wanted_model()
+        sess = ClaudeSession(
+            cwd=WORKSPACE_DIR,
+            model=wanted,
+            tmux_window="claude-search",
+            persist_state=False,
+        )
+        try:
+            return await sess.ask(prompt)
+        finally:
+            try:
+                await sess.kill()
+            except Exception as e:
+                log.warning("search session cleanup failed: %s", e)
 
 
 claude = ClaudeRunner()
@@ -267,7 +266,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
-    claude.reset(update.effective_user.id)
+    await claude.reset(update.effective_user.id)
     await update.message.reply_text("New session started.")
 
 
@@ -376,44 +375,14 @@ async def cmd_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = " ".join(ctx.args).strip()
     full_prompt = _FILE_SEARCH_SYSTEM + "\n\nUser request: " + query
 
-    cmd = [
-        "claude",
-        "-p", full_prompt,
-        "--output-format", "json",
-        "--dangerously-skip-permissions",
-    ]
-    model = load_model()
-    if model != "default":
-        cmd += ["--model", model]
     log.info("file-search [isolated] query=%s", query[:200])
-
     await update.message.reply_chat_action("typing")
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(WORKSPACE_DIR),
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=CLAUDE_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await update.message.reply_text(f"Timeout after {CLAUDE_TIMEOUT}s.")
-        return
-
-    if proc.returncode != 0:
-        msg = stderr.decode(errors="replace")[:500] or "(no output)"
-        await update.message.reply_text(f"Claude error (exit {proc.returncode}): {msg}")
-        return
-
-    try:
-        wrapper = json.loads(stdout.decode(errors="replace"))
-        result_text = wrapper.get("result", "")
-    except json.JSONDecodeError:
-        await update.message.reply_text("Could not parse Claude wrapper JSON.")
+        result_text = await claude.search(full_prompt)
+    except Exception as e:
+        log.exception("file-search failed")
+        await update.message.reply_text(f"Claude error: {e}")
         return
 
     parsed = _extract_json_block(result_text)

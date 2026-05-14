@@ -35,5 +35,51 @@ elif [ -f "$INIT_SCRIPT" ]; then
     echo "[entrypoint] Found $INIT_SCRIPT but it is not executable; skipping"
 fi
 
+# Pre-trust the workspace and install SessionStart hook so the bot can
+# drive Claude Code interactively without manual prompts.
+echo "[entrypoint] Installing Claude Code SessionStart hook + pre-trust..."
+gosu node python3 - <<'PYEOF'
+import json, os, pathlib
+home = pathlib.Path(os.environ["HOME"])
+
+trust_file = home / ".claude.json"
+try:
+    trust_data = json.loads(trust_file.read_text()) if trust_file.exists() else {}
+except json.JSONDecodeError:
+    trust_data = {}
+projects = trust_data.setdefault("projects", {})
+ws_entry = projects.setdefault("/workspace", {})
+ws_entry["hasTrustDialogAccepted"] = True
+ws_entry.setdefault("hasCompletedProjectOnboarding", True)
+trust_file.write_text(json.dumps(trust_data, indent=2))
+print(f"[entrypoint]   pre-trusted /workspace in {trust_file}")
+
+settings_path = home / ".claude" / "settings.json"
+settings_path.parent.mkdir(parents=True, exist_ok=True)
+try:
+    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+except json.JSONDecodeError:
+    settings = {}
+hooks = settings.setdefault("hooks", {})
+session_start = hooks.setdefault("SessionStart", [])
+hook_cmd = "python3 /app/bot/hook_runner.py"
+exists = any(
+    isinstance(g, dict)
+    and any(
+        isinstance(h, dict) and h.get("command") == hook_cmd
+        for h in (g.get("hooks") or [])
+    )
+    for g in session_start
+)
+if not exists:
+    session_start.append(
+        {"hooks": [{"type": "command", "command": hook_cmd, "timeout": 5}]}
+    )
+    settings_path.write_text(json.dumps(settings, indent=2))
+    print(f"[entrypoint]   installed SessionStart hook in {settings_path}")
+else:
+    print(f"[entrypoint]   SessionStart hook already present in {settings_path}")
+PYEOF
+
 echo "[entrypoint] Starting bot as user node..."
 exec gosu node python3 -u -m bot.main
