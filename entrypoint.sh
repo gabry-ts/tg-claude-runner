@@ -63,22 +63,29 @@ except json.JSONDecodeError:
 hooks = settings.setdefault("hooks", {})
 session_start = hooks.setdefault("SessionStart", [])
 hook_cmd = "python3 /app/bot/hook_runner.py"
-exists = any(
-    isinstance(g, dict)
-    and any(
-        isinstance(h, dict) and h.get("command") == hook_cmd
-        for h in (g.get("hooks") or [])
+hook_matcher = "startup|resume|clear"
+
+# Drop any existing entry that mentions our command (covers older installs
+# that lacked a matcher and never fired). Then add a fresh, correct one.
+filtered = [
+    g for g in session_start
+    if not (
+        isinstance(g, dict)
+        and any(
+            isinstance(h, dict) and h.get("command") == hook_cmd
+            for h in (g.get("hooks") or [])
+        )
     )
-    for g in session_start
+]
+filtered.append(
+    {
+        "matcher": hook_matcher,
+        "hooks": [{"type": "command", "command": hook_cmd, "timeout": 5}],
+    }
 )
-if not exists:
-    session_start.append(
-        {"hooks": [{"type": "command", "command": hook_cmd, "timeout": 5}]}
-    )
-    settings_path.write_text(json.dumps(settings, indent=2))
-    print(f"[entrypoint]   installed SessionStart hook in {settings_path}")
-else:
-    print(f"[entrypoint]   SessionStart hook already present in {settings_path}")
+hooks["SessionStart"] = filtered
+settings_path.write_text(json.dumps(settings, indent=2))
+print(f"[entrypoint]   SessionStart hook ensured in {settings_path}")
 PYEOF
 
 echo "[entrypoint] Starting bot as user node..."
