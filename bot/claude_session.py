@@ -62,6 +62,10 @@ _ONBOARDING_PATTERNS = [
     re.compile(r"Press Enter to continue", re.M),
 ]
 
+_BYPASS_WARNING_PATTERN = re.compile(
+    r"Bypass Permissions mode.*accept all responsibility", re.S
+)
+
 
 def _looks_like_permission_prompt(pane_text: str) -> bool:
     return any(p.search(pane_text) for p in _PERMISSION_PROMPT_PATTERNS)
@@ -69,6 +73,10 @@ def _looks_like_permission_prompt(pane_text: str) -> bool:
 
 def _looks_like_onboarding(pane_text: str) -> bool:
     return any(p.search(pane_text) for p in _ONBOARDING_PATTERNS)
+
+
+def _looks_like_bypass_warning(pane_text: str) -> bool:
+    return _BYPASS_WARNING_PATTERN.search(pane_text) is not None
 
 
 @dataclass
@@ -184,6 +192,22 @@ class ClaudeSession:
                 last_dismiss = now
                 await self._try_dismiss_onboarding(window)
             await asyncio.sleep(0.3)
+
+        # Final diagnostic: log what claude is showing so we know what we're stuck on
+        if window is not None:
+            def _final_capture() -> str:
+                try:
+                    pane = window.active_pane
+                    if pane is None:
+                        return ""
+                    return "\n".join(pane.capture_pane())
+                except Exception:
+                    return ""
+            pane_text = await asyncio.to_thread(_final_capture)
+            if pane_text:
+                log.error("timeout pane content (last 30 lines):\n%s",
+                          "\n".join(pane_text.splitlines()[-30:]))
+
         raise ClaudeSessionError(
             f"SessionStart hook did not write session_map within {timeout}s"
         )
@@ -199,19 +223,48 @@ class ClaudeSession:
                 return ""
 
         pane_text = await asyncio.to_thread(_capture)
-        if not pane_text or not _looks_like_onboarding(pane_text):
+        if not pane_text:
             return
-        log.warning("claude is on an onboarding screen, sending Enter to accept defaults")
 
-        def _send() -> None:
-            try:
-                pane = window.active_pane
-                if pane is not None:
-                    pane.send_keys("", enter=True, literal=False)
-            except Exception as e:
-                log.debug("onboarding dismiss send_keys failed: %s", e)
+        if _looks_like_bypass_warning(pane_text):
+            # Default selection is "1. No, exit" — we must pick "2. Yes, I accept"
+            log.warning("dismissing bypass-permissions warning: selecting Yes (2)+Enter")
 
-        await asyncio.to_thread(_send)
+            def _do() -> None:
+                try:
+                    pane = window.active_pane
+                    if pane is None:
+                        return
+                    pane.send_keys("2", enter=False, literal=True)
+                except Exception as e:
+                    log.debug("bypass select 2 failed: %s", e)
+
+            await asyncio.to_thread(_do)
+            await asyncio.sleep(0.3)
+
+            def _enter() -> None:
+                try:
+                    pane = window.active_pane
+                    if pane is not None:
+                        pane.send_keys("", enter=True, literal=False)
+                except Exception as e:
+                    log.debug("bypass enter failed: %s", e)
+
+            await asyncio.to_thread(_enter)
+            return
+
+        if _looks_like_onboarding(pane_text):
+            log.warning("dismissing onboarding screen (Enter accepts default)")
+
+            def _send() -> None:
+                try:
+                    pane = window.active_pane
+                    if pane is not None:
+                        pane.send_keys("", enter=True, literal=False)
+                except Exception as e:
+                    log.debug("onboarding dismiss send_keys failed: %s", e)
+
+            await asyncio.to_thread(_send)
 
     def _jsonl_path(self, session_id: str, cwd: str) -> Path:
         return (
