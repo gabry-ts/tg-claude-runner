@@ -46,6 +46,7 @@ JSONL_POLL_S = float(os.environ.get("TGCR_JSONL_POLL", "1.0"))
 SEND_KEYS_PAUSE_S = float(os.environ.get("TGCR_SEND_PAUSE", "0.5"))
 BOOT_GRACE_S = float(os.environ.get("TGCR_BOOT_GRACE", "3.0"))
 PROMPT_CHECK_EVERY_N = int(os.environ.get("TGCR_PROMPT_CHECK_EVERY", "5"))
+END_TURN_GRACE_S = float(os.environ.get("TGCR_END_TURN_GRACE", "10.0"))
 
 _PERMISSION_PROMPT_PATTERNS = [
     re.compile(r"^\s*Do you want to (proceed|make|create|delete|allow)", re.M),
@@ -432,12 +433,25 @@ class ClaudeSession:
         timeout: float = RESPONSE_TIMEOUT_S,
         on_tool_use: ToolUseCallback | None = None,
     ) -> str:
+        """Tail the JSONL until the assistant turn is complete.
+
+        Claude Code 2.1.x with extended thinking sometimes splits one logical
+        turn into TWO assistant entries, both flagged stop_reason=end_turn —
+        first one carrying only a `thinking` block, the second carrying the
+        actual `text` a few seconds later. Returning on the first one would
+        yield an empty response and shift every subsequent reply by one turn.
+
+        Strategy: on every end_turn without text, start a grace timer. Keep
+        reading; if a later entry with text arrives, return it. If the grace
+        expires with no text, then return empty (a genuine no-response turn).
+        """
         if self._info is None:
             raise ClaudeSessionError("session not started")
         path = self._info.jsonl_path
         deadline = time.time() + timeout
 
         last_text = ""
+        empty_end_turn_at = 0.0
         iter_count = 0
         while time.time() < deadline:
             if not path.exists():
@@ -472,10 +486,32 @@ class ClaudeSession:
                                     except Exception as e:
                                         log.debug("on_tool_use callback failed: %s", e)
                             if transcript.is_end_turn(entry):
-                                return last_text or ""
+                                if last_text:
+                                    return last_text
+                                if empty_end_turn_at == 0.0:
+                                    empty_end_turn_at = time.time()
+                                    log.debug(
+                                        "end_turn observed without text; waiting "
+                                        "%.1fs for a follow-up entry",
+                                        END_TURN_GRACE_S,
+                                    )
             except FileNotFoundError:
                 await asyncio.sleep(JSONL_POLL_S)
                 continue
+
+            if (
+                empty_end_turn_at > 0.0
+                and not last_text
+                and time.time() - empty_end_turn_at >= END_TURN_GRACE_S
+            ):
+                log.warning(
+                    "end_turn had no text after %.1fs grace; returning empty",
+                    END_TURN_GRACE_S,
+                )
+                return ""
+
+            if empty_end_turn_at > 0.0 and last_text:
+                return last_text
 
             iter_count += 1
             if iter_count % PROMPT_CHECK_EVERY_N == 0:
