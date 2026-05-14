@@ -47,12 +47,16 @@ try:
     trust_data = json.loads(trust_file.read_text()) if trust_file.exists() else {}
 except json.JSONDecodeError:
     trust_data = {}
+trust_data["hasCompletedOnboarding"] = True
+trust_data.setdefault("hasSeenTasksHint", True)
+trust_data.setdefault("hasSeenStashHint", True)
+trust_data.setdefault("hasIdeOnboardingBeenShown", True)
 projects = trust_data.setdefault("projects", {})
 ws_entry = projects.setdefault("/workspace", {})
 ws_entry["hasTrustDialogAccepted"] = True
 ws_entry.setdefault("hasCompletedProjectOnboarding", True)
 trust_file.write_text(json.dumps(trust_data, indent=2))
-print(f"[entrypoint]   pre-trusted /workspace in {trust_file}")
+print(f"[entrypoint]   pre-trusted /workspace + onboarding flags in {trust_file}")
 
 settings_path = home / ".claude" / "settings.json"
 settings_path.parent.mkdir(parents=True, exist_ok=True)

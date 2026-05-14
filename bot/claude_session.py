@@ -54,9 +54,21 @@ _PERMISSION_PROMPT_PATTERNS = [
     re.compile(r"^\s*This command requires approval", re.M),
 ]
 
+_ONBOARDING_PATTERNS = [
+    re.compile(r"Choose the text style", re.M),
+    re.compile(r"Let's get started", re.M),
+    re.compile(r"Use Claude's default IDE", re.M),
+    re.compile(r"Tell us about your role", re.M),
+    re.compile(r"Press Enter to continue", re.M),
+]
+
 
 def _looks_like_permission_prompt(pane_text: str) -> bool:
     return any(p.search(pane_text) for p in _PERMISSION_PROMPT_PATTERNS)
+
+
+def _looks_like_onboarding(pane_text: str) -> bool:
+    return any(p.search(pane_text) for p in _ONBOARDING_PATTERNS)
 
 
 @dataclass
@@ -150,8 +162,11 @@ class ClaudeSession:
 
         return await asyncio.to_thread(_do)
 
-    async def _wait_for_session_id(self, timeout: float) -> tuple[str, str]:
+    async def _wait_for_session_id(
+        self, timeout: float, window: "libtmux.Window | None" = None
+    ) -> tuple[str, str]:
         deadline = time.time() + timeout
+        last_dismiss = 0.0
         while time.time() < deadline:
             if SESSION_MAP_FILE.exists():
                 try:
@@ -163,10 +178,40 @@ class ClaudeSession:
                         return sid, cwd
                 except Exception:
                     pass
+
+            now = time.time()
+            if window is not None and now - last_dismiss > 3.0:
+                last_dismiss = now
+                await self._try_dismiss_onboarding(window)
             await asyncio.sleep(0.3)
         raise ClaudeSessionError(
             f"SessionStart hook did not write session_map within {timeout}s"
         )
+
+    async def _try_dismiss_onboarding(self, window: "libtmux.Window") -> None:
+        def _capture() -> str:
+            try:
+                pane = window.active_pane
+                if pane is None:
+                    return ""
+                return "\n".join(pane.capture_pane())
+            except Exception:
+                return ""
+
+        pane_text = await asyncio.to_thread(_capture)
+        if not pane_text or not _looks_like_onboarding(pane_text):
+            return
+        log.warning("claude is on an onboarding screen, sending Enter to accept defaults")
+
+        def _send() -> None:
+            try:
+                pane = window.active_pane
+                if pane is not None:
+                    pane.send_keys("", enter=True, literal=False)
+            except Exception as e:
+                log.debug("onboarding dismiss send_keys failed: %s", e)
+
+        await asyncio.to_thread(_send)
 
     def _jsonl_path(self, session_id: str, cwd: str) -> Path:
         return (
@@ -201,7 +246,9 @@ class ClaudeSession:
             window.window_id, bool(resume_id), self._persist_state,
         )
 
-        session_id, hook_cwd = await self._wait_for_session_id(SESSION_ID_TIMEOUT_S)
+        session_id, hook_cwd = await self._wait_for_session_id(
+            SESSION_ID_TIMEOUT_S, window=window
+        )
         jsonl = self._jsonl_path(session_id, hook_cwd)
         offset = jsonl.stat().st_size if jsonl.exists() else 0
 
