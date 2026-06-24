@@ -41,14 +41,7 @@ CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", "/home/node/.claude"))
 CLAUDE_CREDS = CLAUDE_HOME / ".credentials.json"
 JOBS_FILE = DATA_DIR / "jobs.json"
 MODEL_FILE = DATA_DIR / "model.json"
-MODEL_CHOICES = [
-    "default",
-    "claude-fable-5",
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5",
-]
+MODEL_CHOICES = ["default", "sonnet", "opus", "haiku"]
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
