@@ -4,7 +4,7 @@ Telegram bot that wraps the [Claude Code](https://docs.claude.com/en/docs/claude
 
 ## What you get
 
-- **Telegram bridge to Claude Code**: free-text messages are driven into a persistent **interactive** Claude Code session running inside a tmux window. Responses are read from Claude's JSONL transcript (`~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`) and streamed back to Telegram. Sessions resume across bot restarts via `--resume <session_id>`. Interactive mode keeps usage on your Claude plan instead of the Agent SDK credit.
+- **Telegram bridge to Claude Code**: free-text messages are sent to Claude Code in headless print mode (`claude -p --output-format stream-json`). Each turn streams back the assistant text plus live tool-use events; the conversation is continued with `--resume <session_id>`, which also lets sessions survive bot restarts.
 - **MarkdownV2 rendering**: Claude's markdown output is auto-escaped to Telegram-safe MarkdownV2 (bold, italic, code, links, code blocks).
 - **Built-in scheduler**: `/schedule add "<cron>" <prompt>` registers a recurring job, persisted to `data/jobs.json`, restored on restart.
 - **Pre-installed CLIs**: `gh`, `git`, `curl`, `wget`, `jq`, `rsync`, `ssh`, `vim`, `nano`, `tree`, `zip/unzip`, plus `node`, `npm`, `python3`, `pip`.
@@ -180,9 +180,7 @@ If `OPENAI_API_KEY` is set in `.env`, voice and audio messages are transcribed v
 | `OPENAI_API_KEY` | (unset) | If set, enables Whisper transcription of voice/audio messages |
 | `WHISPER_MODEL` | `whisper-1` | Whisper model to use |
 | `TGCR_RESPONSE_TIMEOUT` | `300` | Max seconds to wait for a Claude reply (per turn) |
-| `TGCR_SESSION_ID_TIMEOUT` | `30` | Max seconds to wait for the SessionStart hook |
-| `TGCR_JSONL_POLL` | `1.0` | Interval (seconds) between JSONL polls while waiting for a reply |
-| `TGCR_BOOT_GRACE` | `3.0` | Seconds to wait after spawning claude before sending the first prompt |
+| `TGCR_CLAUDE_BIN` | `claude` | Path to the Claude Code binary |
 
 ## Layout
 
@@ -190,18 +188,15 @@ If `OPENAI_API_KEY` is set in `.env`, voice and audio messages are transcribed v
 .
 ├── bot/
 │   ├── main.py            # entrypoint: handlers, ClaudeRunner facade
-│   ├── claude_session.py  # interactive Claude window driven via libtmux + JSONL tail
-│   ├── transcript.py      # pure-function parser for Claude Code JSONL events
+│   ├── claude_session.py  # Claude conversation driven via `claude -p` (stream-json)
+│   ├── transcript.py      # pure-function parser for Claude Code stream-json events
 │   ├── session_state.py   # persistence of session_id/cwd across restarts
-│   ├── hook_runner.py     # SessionStart hook (Claude invokes this directly)
 │   ├── markdown_v2.py     # markdown -> Telegram MarkdownV2 conversion
 │   └── scheduler.py       # JobQueue persistence (data/jobs.json)
-├── scripts/
-│   └── poc_tmux_jsonl.py  # standalone PoC for the tmux+JSONL technique (debug)
 ├── data/                  # bot internal state (jobs.json) — bind-mounted
 ├── docker-compose.yml
 ├── Dockerfile
-├── entrypoint.sh          # installs SessionStart hook, pre-trusts /workspace
+├── entrypoint.sh          # pre-trusts /workspace, clears onboarding prompts
 ├── requirements.txt
 └── .env.example
 ```
@@ -215,22 +210,20 @@ Telegram message
 bot/main.py handler  ──▶  ClaudeRunner.ask(uid, text)
                               │
                               ▼
-                       ClaudeSession.ensure_started()
+                       ClaudeSession.ask(text)
                               │
-                              │  libtmux: new window "claude" running
-                              │     env IS_SANDBOX=1 claude --dangerously-skip-permissions [--resume <id>]
+                              │  spawn: claude -p --output-format stream-json --verbose
+                              │         --dangerously-skip-permissions [--resume <id>] [--model <m>]
+                              │  the prompt is written to the subprocess stdin
                               ▼
-                       SessionStart hook (bot/hook_runner.py)
-                              │  writes session_map.json with session_id + cwd
+                       read stdout stream-json events
+                              │  assistant events  ── live tool_use → status edits
+                              │  result event      ── final text + session_id
                               ▼
-                       ClaudeSession.send_prompt(text)        ── tmux send-keys -l + Enter
-                       ClaudeSession.wait_for_response()      ── aiofiles tail of JSONL transcript
-                              │                                  until message.stop_reason == "end_turn"
-                              ▼
-                       extracted text  ──▶  Telegram reply
+                       session_id saved to state.json  ──▶  Telegram reply
 ```
 
-Each `/new` kills the current tmux window and lets the next prompt spawn a fresh Claude session. `/file` uses a separate ephemeral window (`claude-search`) so its lookup never pollutes the chat session.
+Each `/new` drops the saved session id so the next prompt starts a fresh Claude session. `/file` runs without `--resume` (a non-persisted one-shot) so its lookup never pollutes the chat session.
 
 ## Security notes
 
