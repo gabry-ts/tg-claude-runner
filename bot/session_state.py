@@ -1,7 +1,7 @@
 """Persistence for the current Claude Code session metadata.
 
-A single JSON file under STATE_DIR holds the session_id and cwd of the
-last live Claude window so the bot can resume after a restart.
+A single JSON file under STATE_DIR holds the session_id, cwd and model of the
+last Claude conversation so the bot can `--resume` it after a restart.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("TGCR_STATE_DIR", str(Path.home() / ".tg-claude-runner")))
 STATE_FILE = STATE_DIR / "state.json"
-SESSION_MAP_FILE = STATE_DIR / "session_map.json"
 
 
 def _atomic_write(path: Path, data: str) -> None:
@@ -47,17 +46,3 @@ def save_state(state: dict) -> None:
 def clear_state() -> None:
     if STATE_FILE.exists():
         STATE_FILE.unlink()
-
-
-def read_session_map() -> dict:
-    if not SESSION_MAP_FILE.exists():
-        return {}
-    try:
-        return json.loads(SESSION_MAP_FILE.read_text())
-    except Exception:
-        return {}
-
-
-def clear_session_map() -> None:
-    if SESSION_MAP_FILE.exists():
-        SESSION_MAP_FILE.unlink()

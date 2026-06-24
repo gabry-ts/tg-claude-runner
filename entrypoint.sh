@@ -35,9 +35,10 @@ elif [ -f "$INIT_SCRIPT" ]; then
     echo "[entrypoint] Found $INIT_SCRIPT but it is not executable; skipping"
 fi
 
-# Pre-trust the workspace and install SessionStart hook so the bot can
-# drive Claude Code interactively without manual prompts.
-echo "[entrypoint] Installing Claude Code SessionStart hook + pre-trust..."
+# Pre-trust the workspace and clear first-run prompts so `claude -p` runs
+# non-interactively. Also strip the legacy SessionStart hook left behind by
+# older tmux-based builds (the bot no longer drives Claude via tmux).
+echo "[entrypoint] Pre-trusting workspace + clearing onboarding prompts..."
 gosu node python3 - <<'PYEOF'
 import json, os, pathlib
 home = pathlib.Path(os.environ["HOME"])
@@ -60,41 +61,37 @@ ws_entry.setdefault("hasCompletedProjectOnboarding", True)
 trust_file.write_text(json.dumps(trust_data, indent=2))
 print(f"[entrypoint]   pre-trusted /workspace + onboarding/bypass flags in {trust_file}")
 
+# Migration: remove the legacy SessionStart hook (hook_runner.py) that older
+# tmux-based installs persisted into settings.json on the bind-mounted home.
 settings_path = home / ".claude" / "settings.json"
-settings_path.parent.mkdir(parents=True, exist_ok=True)
-try:
-    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
-except json.JSONDecodeError:
-    settings = {}
-perms = settings.setdefault("permissions", {})
-perms.setdefault("defaultMode", "bypassPermissions")
-
-hooks = settings.setdefault("hooks", {})
-session_start = hooks.setdefault("SessionStart", [])
-hook_cmd = "python3 /app/bot/hook_runner.py"
-hook_matcher = "startup|resume|clear"
-
-# Drop any existing entry that mentions our command (covers older installs
-# that lacked a matcher and never fired). Then add a fresh, correct one.
-filtered = [
-    g for g in session_start
-    if not (
-        isinstance(g, dict)
-        and any(
-            isinstance(h, dict) and h.get("command") == hook_cmd
-            for h in (g.get("hooks") or [])
+if settings_path.exists():
+    try:
+        settings = json.loads(settings_path.read_text())
+    except json.JSONDecodeError:
+        settings = {}
+    hooks = settings.get("hooks") or {}
+    session_start = hooks.get("SessionStart") or []
+    kept = [
+        g for g in session_start
+        if not (
+            isinstance(g, dict)
+            and any(
+                isinstance(h, dict) and "hook_runner.py" in (h.get("command") or "")
+                for h in (g.get("hooks") or [])
+            )
         )
-    )
-]
-filtered.append(
-    {
-        "matcher": hook_matcher,
-        "hooks": [{"type": "command", "command": hook_cmd, "timeout": 5}],
-    }
-)
-hooks["SessionStart"] = filtered
-settings_path.write_text(json.dumps(settings, indent=2))
-print(f"[entrypoint]   SessionStart hook ensured in {settings_path}")
+    ]
+    if kept != session_start:
+        if kept:
+            hooks["SessionStart"] = kept
+        else:
+            hooks.pop("SessionStart", None)
+        if hooks:
+            settings["hooks"] = hooks
+        else:
+            settings.pop("hooks", None)
+        settings_path.write_text(json.dumps(settings, indent=2))
+        print(f"[entrypoint]   removed legacy SessionStart hook from {settings_path}")
 PYEOF
 
 echo "[entrypoint] Starting bot as user node..."

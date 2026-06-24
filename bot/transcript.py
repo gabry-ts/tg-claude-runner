@@ -1,21 +1,16 @@
-"""Pure-function parser for Claude Code JSONL transcripts.
+"""Pure-function parser for Claude Code `stream-json` events.
 
-Each line in ~/.claude/projects/<encoded-cwd>/<session_id>.jsonl is a JSON
-object describing one event in the conversation. We only care about a few:
-the assistant turn (carries stop_reason and text content), tool_use blocks
-(useful for live UI), and tool_result blocks. Everything else is ignored.
+`claude -p --output-format stream-json` emits one JSON object per line on
+stdout. We only care about a few event types: the `assistant` turn (carries
+text and tool_use content blocks), and the terminal `result` event (carries
+the final consolidated text, session id, and error flag). Everything else is
+ignored.
 """
 
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
-
-
-def encode_cwd(cwd: str) -> str:
-    """Mirror Claude Code's projects-dir naming: non-alphanumeric → '-'."""
-    return re.sub(r"[^a-zA-Z0-9-]", "-", cwd)
 
 
 def parse_line(raw: str) -> dict | None:
@@ -28,19 +23,32 @@ def parse_line(raw: str) -> dict | None:
         return None
 
 
-def stop_reason(entry: dict) -> str | None:
-    msg = entry.get("message")
-    if not isinstance(msg, dict):
-        return None
-    return msg.get("stop_reason")
+def event_type(entry: dict) -> str | None:
+    return entry.get("type")
+
+
+def session_id(entry: dict) -> str | None:
+    return entry.get("session_id")
 
 
 def is_assistant(entry: dict) -> bool:
     return entry.get("type") == "assistant"
 
 
-def is_end_turn(entry: dict) -> bool:
-    return is_assistant(entry) and stop_reason(entry) == "end_turn"
+def is_result(entry: dict) -> bool:
+    return entry.get("type") == "result"
+
+
+def is_error_result(entry: dict) -> bool:
+    if not is_result(entry):
+        return False
+    if entry.get("is_error"):
+        return True
+    return str(entry.get("subtype", "")).startswith("error")
+
+
+def result_text(entry: dict) -> str:
+    return (entry.get("result") or "").strip()
 
 
 def extract_text(entry: dict) -> str:

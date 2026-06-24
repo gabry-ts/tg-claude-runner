@@ -69,7 +69,7 @@ _FILE_SEARCH_SYSTEM = (
 
 
 class ClaudeRunner:
-    """Single persistent Claude Code window driven via tmux + JSONL.
+    """Single persistent Claude Code conversation driven via `claude -p`.
 
     Single-user bot: one main session for chat, ephemeral sessions for
     isolated lookups (see search()). Lock per uid is kept for API
@@ -117,16 +117,15 @@ class ClaudeRunner:
                 return f"Claude session error: {e}"
 
     async def search(self, prompt: str) -> str:
-        """Run an isolated one-shot query in a fresh ephemeral window.
+        """Run an isolated one-shot query in a fresh, non-persisted session.
 
         Used by /file so the search context never pollutes the main chat
-        session. The window is killed after the response.
+        session: it runs without --resume and never saves a session id.
         """
         wanted = self._wanted_model()
         sess = ClaudeSession(
             cwd=WORKSPACE_DIR,
             model=wanted,
-            tmux_window="claude-search",
             persist_state=False,
         )
         try:
