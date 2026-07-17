@@ -142,11 +142,15 @@ scheduler: Scheduler | None = None
 
 
 def is_authed() -> bool:
-    """True only if credentials exist AND the OAuth token has not expired.
+    """True if credentials exist and are usable.
 
-    A stored token can outlive its ``expiresAt`` with no usable refresh token,
-    in which case Claude returns 401 and the session fails. Catching it here
-    lets the bot ask the user to /login instead of failing on every message.
+    ``expiresAt`` only bounds the short-lived access token: when a
+    ``refreshToken`` is present the CLI silently renews the access token on
+    its next invocation and rewrites the credentials file, so refusing to run
+    Claude here would block that refresh and force a pointless /login every
+    few hours. Only credentials that are expired AND lack a refresh token are
+    truly dead (Claude would 401 on every message) — catching that case lets
+    the bot ask for /login instead of failing on every message.
     """
     if not CLAUDE_CREDS.exists():
         return False
@@ -154,9 +158,10 @@ def is_authed() -> bool:
         data = json.loads(CLAUDE_CREDS.read_text())
         oauth = data.get("claudeAiOauth") or data
         expires_at = oauth.get("expiresAt")
+        refresh_token = oauth.get("refreshToken")
     except Exception:
         return True  # unknown shape — assume usable, let Claude surface errors
-    if not expires_at:
+    if refresh_token or not expires_at:
         return True
     return expires_at > time.time() * 1000
 
