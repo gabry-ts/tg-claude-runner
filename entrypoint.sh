@@ -54,12 +54,13 @@ trust_data.setdefault("hasSeenStashHint", True)
 trust_data.setdefault("hasIdeOnboardingBeenShown", True)
 trust_data["bypassPermissionsModeAccepted"] = True
 trust_data["hasAcceptedBypassPermissionsModeWarning"] = True
+workspace = os.environ.get("WORKSPACE_DIR", "/workspace")
 projects = trust_data.setdefault("projects", {})
-ws_entry = projects.setdefault("/workspace", {})
+ws_entry = projects.setdefault(workspace, {})
 ws_entry["hasTrustDialogAccepted"] = True
 ws_entry.setdefault("hasCompletedProjectOnboarding", True)
 trust_file.write_text(json.dumps(trust_data, indent=2))
-print(f"[entrypoint]   pre-trusted /workspace + onboarding/bypass flags in {trust_file}")
+print(f"[entrypoint]   pre-trusted {workspace} + onboarding/bypass flags in {trust_file}")
 
 # Migration: remove the legacy SessionStart hook (hook_runner.py) that older
 # tmux-based installs persisted into settings.json on the bind-mounted home.

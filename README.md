@@ -84,7 +84,9 @@ security find-generic-password -s "Claude Code-credentials" -w
 cat ~/.claude/.credentials.json
 ```
 
-Paste the JSON to the bot. It's written to `/home/node/.claude/.credentials.json`, which lives in the bind-mounted `~/claude_bot/` so it persists across everything.
+Paste the JSON to the bot. It's written to `/home/node/.claude/.credentials.json`, which lives in the bind-mounted `~/claude_bot/` so it persists across everything. The bot deletes your pasted message right after saving, so the OAuth token doesn't linger in the chat history.
+
+The credentials contain a short-lived access token plus a refresh token; the Claude CLI renews the access token automatically, so a single `/login` normally lasts until the refresh token itself is invalidated (e.g. rotated by another machine using the same account). When that happens the bot tells you explicitly to `/login` again.
 
 ## Scheduling
 
@@ -97,7 +99,7 @@ Standard 5-field cron (`min hour dom month dow`). Quote the cron expression:
 /schedule remove abc12345
 ```
 
-Each fire reuses the most recent Claude session for that user. Use `/new` to start fresh.
+Each fire runs in an **isolated one-shot session** (no `--resume`), so scheduled jobs never pollute your interactive chat context.
 
 ## Sending files back to Telegram
 
@@ -148,7 +150,7 @@ sudo apt-get install -y postgresql-client redis-tools
 | `/auth` | check Claude auth status |
 | `/login` | paste Claude credentials |
 | `/new` | reset Claude session |
-| `/compact` | compact Claude conversation context |
+| `/compact` | compact context: summarize the session, then restart it seeded with the summary |
 | `/file <query>` | retrieve file(s) matching a description (Claude searches workspace, isolated session) |
 | `/get <path>` | send a single workspace file by path (no Claude call) |
 | `/schedule add "<cron>" <prompt>` | register recurring prompt |
@@ -179,7 +181,7 @@ If `OPENAI_API_KEY` is set in `.env`, voice and audio messages are transcribed v
 | `CLAUDE_BOT_HOME` | `${HOME}/claude_bot` | Host folder bind-mounted at `/home/node` |
 | `OPENAI_API_KEY` | (unset) | If set, enables Whisper transcription of voice/audio messages |
 | `WHISPER_MODEL` | `whisper-1` | Whisper model to use |
-| `TGCR_RESPONSE_TIMEOUT` | `300` | Max seconds to wait for a Claude reply (per turn) |
+| `TGCR_RESPONSE_TIMEOUT` | `1800` | Max seconds to wait for a Claude reply (per turn) |
 | `TGCR_CLAUDE_BIN` | `claude` | Path to the Claude Code binary |
 
 ## Layout
@@ -223,7 +225,7 @@ bot/main.py handler  ──▶  ClaudeRunner.ask(uid, text)
                        session_id saved to state.json  ──▶  Telegram reply
 ```
 
-Each `/new` drops the saved session id so the next prompt starts a fresh Claude session. `/file` runs without `--resume` (a non-persisted one-shot) so its lookup never pollutes the chat session.
+Each `/new` drops the saved session id so the next prompt starts a fresh Claude session. `/file` and scheduled jobs run without `--resume` (non-persisted one-shots) so they never pollute the chat session.
 
 ## Security notes
 

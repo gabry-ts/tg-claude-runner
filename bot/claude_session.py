@@ -24,7 +24,7 @@ from .session_state import clear_state, load_state, save_state
 log = logging.getLogger(__name__)
 
 CLAUDE_BIN = os.environ.get("TGCR_CLAUDE_BIN", "claude")
-RESPONSE_TIMEOUT_S = float(os.environ.get("TGCR_RESPONSE_TIMEOUT", "300"))
+RESPONSE_TIMEOUT_S = float(os.environ.get("TGCR_RESPONSE_TIMEOUT", "1800"))
 
 
 class ClaudeSessionError(RuntimeError):

@@ -8,7 +8,7 @@ import time
 import asyncio
 import logging
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
 
@@ -110,17 +110,13 @@ class ClaudeRunner:
                 self._main.set_model(wanted)
 
             log.info("ask: %s", text[:200])
-            try:
-                return await self._main.ask(text, on_tool_use=on_tool_use)
-            except ClaudeSessionError as e:
-                log.error("ClaudeSession error: %s", e)
-                return f"Claude session error: {e}"
+            return await self._main.ask(text, on_tool_use=on_tool_use)
 
-    async def search(self, prompt: str) -> str:
+    async def ask_isolated(self, prompt: str) -> str:
         """Run an isolated one-shot query in a fresh, non-persisted session.
 
-        Used by /file so the search context never pollutes the main chat
-        session: it runs without --resume and never saves a session id.
+        Used by /file and scheduled jobs so their context never pollutes the
+        main chat session: runs without --resume and never saves a session id.
         """
         wanted = self._wanted_model()
         sess = ClaudeSession(
@@ -134,7 +130,7 @@ class ClaudeRunner:
             try:
                 await sess.kill()
             except Exception as e:
-                log.warning("search session cleanup failed: %s", e)
+                log.warning("isolated session cleanup failed: %s", e)
 
 
 claude = ClaudeRunner()
@@ -164,6 +160,36 @@ def is_authed() -> bool:
     if refresh_token or not expires_at:
         return True
     return expires_at > time.time() * 1000
+
+
+_AUTH_ERROR_MARKERS = (
+    "401",
+    "unauthor",
+    "authentication_error",
+    "invalid api key",
+    "invalid bearer token",
+    "oauth token",
+    "token expired",
+    "token has expired",
+    "revoked",
+    "please run /login",
+    "not logged in",
+)
+
+
+def session_error_reply(e: Exception) -> str:
+    """Telegram-friendly message for a failed Claude run.
+
+    Auth failures get an explicit /login hint instead of a raw CLI error —
+    otherwise the user has no way to tell a dead token from a transient error.
+    """
+    err = str(e).lower()
+    if any(m in err for m in _AUTH_ERROR_MARKERS):
+        return (
+            "⚠️ Claude authentication failed — credentials expired or revoked. "
+            "Use /login to re-authenticate."
+        )
+    return f"Claude session error: {e}"
 
 
 def save_credentials_json(creds_json: str) -> None:
@@ -246,22 +272,35 @@ async def _send_file(update: Update, path: Path, caption: str | None = None) -> 
         await update.message.reply_text(f"Failed to send {path.name}: {e}")
 
 
-async def reply_md(update: Update, text: str) -> None:
+async def send_md(bot, chat_id: int, text: str) -> None:
+    """Send text as MarkdownV2, falling back to plain per chunk.
+
+    The original text is split first and each chunk converted independently,
+    so a chunk whose conversion Telegram rejects falls back to plain text on
+    its own — earlier chunks are never re-sent. The split margin (3000 vs
+    Telegram's 4096) leaves room for escape backslashes added by conversion;
+    a chunk that still overflows after conversion is sent plain.
+    """
     if not text:
         text = "(no response)"
-    converted = to_telegram_markdown(text)
-    for chunk in split_for_telegram(converted):
-        try:
-            await update.message.reply_text(
-                chunk,
-                parse_mode="MarkdownV2",
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            log.warning("MarkdownV2 send failed (%s); falling back to plain", e)
-            for plain in split_for_telegram(text):
-                await update.message.reply_text(plain)
-            return
+    for chunk in split_for_telegram(text, max_len=3000):
+        converted = to_telegram_markdown(chunk)
+        if len(converted) <= 4000:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=converted,
+                    parse_mode="MarkdownV2",
+                    disable_web_page_preview=True,
+                )
+                continue
+            except Exception as e:
+                log.warning("MarkdownV2 send failed (%s); falling back to plain", e)
+        await bot.send_message(chat_id=chat_id, text=chunk)
+
+
+async def reply_md(update: Update, text: str) -> None:
+    await send_md(update.get_bot(), update.effective_chat.id, text)
 
 
 def _format_tool(tu: ToolUse) -> str:
@@ -316,6 +355,13 @@ async def claude_reply(update: Update, prompt: str) -> None:
 
     try:
         resp = await claude.ask(uid, prompt, on_tool_use=on_tool)
+    except ClaudeSessionError as e:
+        log.error("claude_reply: session error: %s", e)
+        try:
+            await status.edit_text(session_error_reply(e))
+        except Exception:
+            pass
+        return
     except Exception as e:
         log.exception("claude_reply: ask failed")
         try:
@@ -364,13 +410,51 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("New session started.")
 
 
+_COMPACT_SUMMARY_PROMPT = (
+    "Summarize this conversation for context compaction. Keep: current goals, "
+    "important decisions, key facts (paths, commands, names), and any "
+    "unfinished work. Be concise but complete. Reply with the summary only."
+)
+
+
 async def cmd_compact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Compact the main session: summarize it, reset, seed a fresh one.
+
+    `claude -p` can't reliably run the interactive /compact slash command, so
+    compaction is done explicitly: ask the current session for a summary,
+    drop it, and start a new session primed with that summary.
+    """
     if not allowed(update):
         return
-    await claude_reply(
-        update,
-        "/compact focus: keep important conversation context",
-    )
+    if not is_authed():
+        await update.message.reply_text("Claude not authenticated. Use /login.")
+        return
+    uid = update.effective_user.id
+    status = await update.message.reply_text("📦 Compacting context…")
+    try:
+        summary = await claude.ask(uid, _COMPACT_SUMMARY_PROMPT)
+        await claude.reset(uid)
+        await claude.ask(
+            uid,
+            "This fresh session is seeded with the compacted summary of the "
+            "previous conversation:\n\n" + summary +
+            "\n\nAcknowledge with one short sentence.",
+        )
+    except ClaudeSessionError as e:
+        log.error("compact failed: %s", e)
+        try:
+            await status.edit_text(session_error_reply(e))
+        except Exception:
+            pass
+        return
+    except Exception as e:
+        log.exception("compact failed")
+        try:
+            await status.edit_text(f"Compact failed: {e}")
+        except Exception:
+            pass
+        return
+    await status.edit_text("Context compacted into a fresh session.")
 
 
 async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -464,6 +548,10 @@ async def cmd_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    if not is_authed():
+        await update.message.reply_text("Claude not authenticated. Use /login.")
+        return
+
     query = " ".join(ctx.args).strip()
     full_prompt = _FILE_SEARCH_SYSTEM + "\n\nUser request: " + query
 
@@ -471,7 +559,11 @@ async def cmd_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_chat_action("typing")
 
     try:
-        result_text = await claude.search(full_prompt)
+        result_text = await claude.ask_isolated(full_prompt)
+    except ClaudeSessionError as e:
+        log.error("file-search failed: %s", e)
+        await update.message.reply_text(session_error_reply(e))
+        return
     except Exception as e:
         log.exception("file-search failed")
         await update.message.reply_text(f"Claude error: {e}")
@@ -622,7 +714,7 @@ async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     raw_name = getattr(obj, "file_name", None) or f"{type(obj).__name__.lower()}{default_ext}"
     safe = _safe_filename(raw_name)
-    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     target = inbox / f"{timestamp}_{safe}"
 
     try:
@@ -673,6 +765,14 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not voice:
         return
 
+    file_size = getattr(voice, "file_size", 0) or 0
+    if file_size > MAX_DOWNLOAD_BYTES:
+        await update.message.reply_text(
+            f"File too large ({file_size // (1024 * 1024)} MB). "
+            "Telegram bot API caps downloads at 20 MB."
+        )
+        return
+
     await update.message.reply_chat_action("typing")
 
     file = await ctx.bot.get_file(voice.file_id)
@@ -713,9 +813,21 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if text.startswith("{") and ("claudeAiOauth" in text or "accessToken" in text):
         try:
             save_credentials_json(text)
-            await update.message.reply_text("Credentials saved. Claude is ready.")
         except Exception as e:
             await update.message.reply_text(f"Invalid JSON: {e}")
+            return
+        # Don't leave the OAuth token sitting in the chat history.
+        try:
+            await update.message.delete()
+            note = "Credentials saved (your message was deleted for safety). Claude is ready."
+        except Exception as e:
+            log.warning("could not delete credentials message: %s", e)
+            note = (
+                "Credentials saved. Claude is ready.\n"
+                "⚠️ Could not delete your message — remove it manually, "
+                "it contains your OAuth token."
+            )
+        await update.effective_chat.send_message(note)
         return
 
     if not is_authed():
@@ -723,6 +835,12 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await claude_reply(update, text)
+
+
+async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    await update.message.reply_text("Unknown command. Use /help.")
 
 
 async def post_init(app: Application) -> None:
@@ -755,24 +873,17 @@ def main() -> None:
     )
 
     async def run_scheduled(prompt: str, chat_id: int, uid: int) -> None:
+        # Isolated one-shot session: recurring jobs must not pollute (or
+        # depend on) the interactive chat session's context.
         try:
-            resp = await claude.ask(uid, prompt)
+            resp = await claude.ask_isolated(prompt)
+        except ClaudeSessionError as e:
+            await app.bot.send_message(chat_id=chat_id, text=session_error_reply(e))
+            return
         except Exception as e:
             await app.bot.send_message(chat_id=chat_id, text=f"Scheduled job error: {e}")
             return
-        converted = to_telegram_markdown(resp)
-        for chunk in split_for_telegram(converted):
-            try:
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    text=chunk,
-                    parse_mode="MarkdownV2",
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                for plain in split_for_telegram(resp):
-                    await app.bot.send_message(chat_id=chat_id, text=plain)
-                return
+        await send_md(app.bot, chat_id, resp)
 
     scheduler = Scheduler(JOBS_FILE, app.job_queue, run_scheduled)
     scheduler.load()
@@ -801,6 +912,9 @@ def main() -> None:
     app.add_handler(MessageHandler(upload_filter, handle_upload))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Last in the group: only fires for commands no CommandHandler matched.
+    app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
 
     app.run_polling(drop_pending_updates=True)
 
