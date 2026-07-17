@@ -5,6 +5,7 @@ Telegram bot that wraps the [Claude Code](https://docs.claude.com/en/docs/claude
 ## What you get
 
 - **Telegram bridge to Claude Code**: free-text messages are sent to Claude Code in headless print mode (`claude -p --output-format stream-json`). Each turn streams back the assistant text plus live tool-use events; the conversation is continued with `--resume <session_id>`, which also lets sessions survive bot restarts.
+- **Message queue**: messages sent while Claude is busy get an instant "📥 Queued" reply and run in order (best-effort FIFO) when the current turn finishes. `/cancel` kills the in-flight run; `/get`, `/auth`, `/login`, `/model` keep working while Claude is busy.
 - **MarkdownV2 rendering**: Claude's markdown output is auto-escaped to Telegram-safe MarkdownV2 (bold, italic, code, links, code blocks).
 - **Built-in scheduler**: `/schedule add "<cron>" <prompt>` registers a recurring job, persisted to `data/jobs.json`, restored on restart.
 - **Pre-installed CLIs**: `gh`, `git`, `curl`, `wget`, `jq`, `rsync`, `ssh`, `vim`, `nano`, `tree`, `zip/unzip`, plus `node`, `npm`, `python3`, `pip`.
@@ -150,6 +151,7 @@ sudo apt-get install -y postgresql-client redis-tools
 | `/auth` | check Claude auth status |
 | `/login` | paste Claude credentials |
 | `/new` | reset Claude session |
+| `/cancel` | kill the current Claude run (queued messages still run) |
 | `/compact` | compact context: summarize the session, then restart it seeded with the summary |
 | `/file <query>` | retrieve file(s) matching a description (Claude searches workspace, isolated session) |
 | `/get <path>` | send a single workspace file by path (no Claude call) |
@@ -181,7 +183,7 @@ If `OPENAI_API_KEY` is set in `.env`, voice and audio messages are transcribed v
 | `CLAUDE_BOT_HOME` | `${HOME}/claude_bot` | Host folder bind-mounted at `/home/node` |
 | `OPENAI_API_KEY` | (unset) | If set, enables Whisper transcription of voice/audio messages |
 | `WHISPER_MODEL` | `whisper-1` | Whisper model to use |
-| `TGCR_RESPONSE_TIMEOUT` | `1800` | Max seconds to wait for a Claude reply (per turn) |
+| `TGCR_RESPONSE_TIMEOUT` | `0` | Max seconds to wait for a Claude reply per turn. `0` = no timeout: a turn runs until Claude finishes or `/cancel` kills it |
 | `TGCR_CLAUDE_BIN` | `claude` | Path to the Claude Code binary |
 
 ## Layout

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -24,11 +25,28 @@ from .session_state import clear_state, load_state, save_state
 log = logging.getLogger(__name__)
 
 CLAUDE_BIN = os.environ.get("TGCR_CLAUDE_BIN", "claude")
-RESPONSE_TIMEOUT_S = float(os.environ.get("TGCR_RESPONSE_TIMEOUT", "1800"))
+# 0 (default) = no timeout: a turn runs until claude finishes or /cancel kills it.
+RESPONSE_TIMEOUT_S = float(os.environ.get("TGCR_RESPONSE_TIMEOUT", "0"))
 
 
 class ClaudeSessionError(RuntimeError):
     pass
+
+
+def _kill_proc_tree(proc: asyncio.subprocess.Process) -> None:
+    """Kill the process group (claude + any children it spawned).
+
+    Children inherit the stdout pipe: killing only claude would leave them
+    holding it open and the stream read blocked until they exit on their own.
+    Requires the process to have been started with start_new_session=True.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
 
 class ClaudeSession:
@@ -48,6 +66,8 @@ class ClaudeSession:
         self.model = model
         self._persist_state = persist_state
         self._session_id: str | None = None
+        self._proc: asyncio.subprocess.Process | None = None
+        self._cancel_requested = False
         if persist_state:
             self._load_session_id()
 
@@ -110,6 +130,7 @@ class ClaudeSession:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            start_new_session=True,
         )
 
         # Feed the prompt on stdin, then close it so claude starts working.
@@ -158,15 +179,29 @@ class ClaudeSession:
                     final_text = transcript.result_text(entry)
                     is_error = transcript.is_error_result(entry)
 
+        self._proc = proc
         try:
-            await asyncio.wait_for(_read_stream(), timeout=timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
+            if timeout > 0:
+                try:
+                    await asyncio.wait_for(_read_stream(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    _kill_proc_tree(proc)
+                    await proc.wait()
+                    stderr_task.cancel()
+                    raise ClaudeSessionError(f"no response within {timeout:.0f}s")
+            else:
+                # No timeout: read until claude exits (or cancel_current()
+                # kills the process, which closes stdout and ends the read).
+                await _read_stream()
             await proc.wait()
-            stderr_task.cancel()
-            raise ClaudeSessionError(f"no response within {timeout:.0f}s")
+        finally:
+            self._proc = None
 
-        await proc.wait()
+        if self._cancel_requested:
+            self._cancel_requested = False
+            stderr_task.cancel()
+            raise ClaudeSessionError("cancelled by user")
+
         stderr = (await stderr_task).decode("utf-8", "replace").strip()
 
         result_text = final_text or "\n".join(accumulated).strip()
@@ -209,6 +244,18 @@ class ClaudeSession:
             or ("session" in e and "not found" in e)
             or ("resume" in e and "found" in e)
         )
+
+    def cancel_current(self) -> bool:
+        """Kill the in-flight `claude -p` run, if any. Safe to call from a
+        handler that does NOT hold the runner lock: the ask() awaiting the
+        killed process sees the cancel flag and raises 'cancelled by user'.
+        """
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return False
+        self._cancel_requested = True
+        _kill_proc_tree(proc)
+        return True
 
     async def reset(self) -> None:
         self._session_id = None

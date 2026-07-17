@@ -84,6 +84,19 @@ class ClaudeRunner:
         m = load_model()
         return None if m == "default" else m
 
+    def busy(self, uid: int) -> bool:
+        return self._locks[uid].locked()
+
+    def cancel(self, uid: int) -> bool:
+        """Kill the in-flight run of the main session, if any.
+
+        Deliberately does NOT take the lock — the whole point is to interrupt
+        the ask() currently holding it. Queued asks behind it still run.
+        """
+        if self._main is None:
+            return False
+        return self._main.cancel_current()
+
     async def reset(self, uid: int) -> None:
         async with self._locks[uid]:
             if self._main is not None:
@@ -340,7 +353,12 @@ async def claude_reply(update: Update, prompt: str) -> None:
     the full response is sent via reply_md().
     """
     uid = update.effective_user.id
-    status = await update.message.reply_text("🤔 thinking…")
+    if claude.busy(uid):
+        status = await update.message.reply_text(
+            "📥 Queued — Claude is still working on the previous message…"
+        )
+    else:
+        status = await update.message.reply_text("🤔 thinking…")
     state = {"last_edit": 0.0}
 
     async def on_tool(tu: ToolUse) -> None:
@@ -390,6 +408,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         "/new - new conversation\n"
+        "/cancel - kill the current Claude run\n"
         "/compact - compact context\n"
         "/auth - check Claude auth status\n"
         "/login - paste Claude credentials\n"
@@ -408,6 +427,18 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await claude.reset(update.effective_user.id)
     await update.message.reply_text("New session started.")
+
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    if claude.cancel(update.effective_user.id):
+        await update.message.reply_text(
+            "⏹ Cancelled the current run. Queued messages (if any) still run — "
+            "send /cancel again to kill the next one."
+        )
+    else:
+        await update.message.reply_text("Nothing is running.")
 
 
 _COMPACT_SUMMARY_PROMPT = (
@@ -846,6 +877,7 @@ async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def post_init(app: Application) -> None:
     commands = [
         BotCommand("new", "new conversation"),
+        BotCommand("cancel", "kill the current Claude run"),
         BotCommand("compact", "compact context"),
         BotCommand("auth", "check auth status"),
         BotCommand("login", "paste credentials"),
@@ -869,6 +901,10 @@ def main() -> None:
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        # Handlers run concurrently so /cancel, /get etc. work while Claude
+        # is busy, and new messages get instant "queued" feedback. Actual
+        # Claude turns stay serialized by ClaudeRunner's per-uid lock (FIFO).
+        .concurrent_updates(True)
         .build()
     )
 
@@ -891,6 +927,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("compact", cmd_compact))
     app.add_handler(CommandHandler("auth", cmd_auth))
     app.add_handler(CommandHandler("login", cmd_login))
