@@ -5,6 +5,7 @@ import os
 import re
 import json
 import time
+import uuid
 import asyncio
 import logging
 import tempfile
@@ -25,6 +26,7 @@ from telegram.ext import (
 from .markdown_v2 import to_telegram_markdown, split_for_telegram
 from .scheduler import Scheduler
 from .claude_session import ClaudeSession, ClaudeSessionError, ToolUseCallback
+from . import transcript
 from .transcript import ToolUse
 
 logging.basicConfig(
@@ -68,17 +70,30 @@ _FILE_SEARCH_SYSTEM = (
 )
 
 
+# Teaches Claude to emit multiple-choice questions in a machine-readable
+# marker the bot renders as Telegram inline buttons (see _extract_tgquestion).
+_TGQ_SYSTEM_PROMPT = (
+    "You are talking to your user through a Telegram bot. When you need the "
+    "user to pick between concrete options, end your reply with one extra "
+    "line in exactly this format (valid JSON, last line, nothing after it):\n"
+    'TGQUESTION: {"question": "<short question>", "options": ["<opt 1>", "<opt 2>"]}\n'
+    "Use 2-6 short options (max 60 chars each), only when a choice is "
+    "genuinely needed. Open-ended questions stay normal text."
+)
+
+
 class ClaudeRunner:
     """Single persistent Claude Code conversation driven via `claude -p`.
 
     Single-user bot: one main session for chat, ephemeral sessions for
-    isolated lookups (see search()). Lock per uid is kept for API
+    isolated lookups (see ask_isolated()). Lock per uid is kept for API
     compatibility even though we currently only allow ALLOWED_USER.
     """
 
     def __init__(self) -> None:
         self._locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._main: ClaudeSession | None = None
+        self._busy_since: float | None = None
 
     def _wanted_model(self) -> str | None:
         m = load_model()
@@ -107,23 +122,42 @@ class ClaudeRunner:
         uid: int,
         text: str,
         on_tool_use: ToolUseCallback | None = None,
+        on_text=None,
     ) -> str:
         async with self._locks[uid]:
-            wanted = self._wanted_model()
-            if self._main is None:
-                self._main = ClaudeSession(
-                    cwd=WORKSPACE_DIR, model=wanted, persist_state=True,
-                )
-            elif self._main.model != wanted:
-                log.info(
-                    "model switched %s -> %s; resetting session",
-                    self._main.model, wanted,
-                )
-                await self._main.reset()
-                self._main.set_model(wanted)
+            self._busy_since = time.time()
+            try:
+                wanted = self._wanted_model()
+                if self._main is None:
+                    self._main = ClaudeSession(
+                        cwd=WORKSPACE_DIR,
+                        model=wanted,
+                        persist_state=True,
+                        append_system_prompt=_TGQ_SYSTEM_PROMPT,
+                    )
+                elif self._main.model != wanted:
+                    log.info(
+                        "model switched %s -> %s; resetting session",
+                        self._main.model, wanted,
+                    )
+                    await self._main.reset()
+                    self._main.set_model(wanted)
 
-            log.info("ask: %s", text[:200])
-            return await self._main.ask(text, on_tool_use=on_tool_use)
+                log.info("ask: %s", text[:200])
+                return await self._main.ask(
+                    text, on_tool_use=on_tool_use, on_text=on_text
+                )
+            finally:
+                self._busy_since = None
+
+    def status_info(self) -> dict:
+        s = self._main
+        return {
+            "session_id": s.session_id if s else None,
+            "busy_since": self._busy_since,
+            "last_result": s.last_result if s else None,
+            "total_cost_usd": s.total_cost_usd if s else 0.0,
+        }
 
     async def ask_isolated(self, prompt: str) -> str:
         """Run an isolated one-shot query in a fresh, non-persisted session.
@@ -268,21 +302,76 @@ def _resolve_workspace_path(raw: str) -> Path | None:
     return resolved
 
 
-async def _send_file(update: Update, path: Path, caption: str | None = None) -> None:
+async def _send_file_to(bot, chat_id: int, path: Path, caption: str | None = None) -> None:
     if not path.exists() or not path.is_file():
-        await update.message.reply_text(f"Not found: {path}")
+        await bot.send_message(chat_id=chat_id, text=f"Not found: {path}")
         return
     ext = path.suffix.lower()
     try:
         with path.open("rb") as fh:
             if ext in IMAGE_EXTS:
-                await update.message.reply_photo(fh, caption=caption)
+                await bot.send_photo(chat_id=chat_id, photo=fh, caption=caption)
             else:
-                await update.message.reply_document(
-                    fh, filename=path.name, caption=caption
+                await bot.send_document(
+                    chat_id=chat_id, document=fh, filename=path.name, caption=caption
                 )
     except Exception as e:
-        await update.message.reply_text(f"Failed to send {path.name}: {e}")
+        await bot.send_message(chat_id=chat_id, text=f"Failed to send {path.name}: {e}")
+
+
+async def _send_file(update: Update, path: Path, caption: str | None = None) -> None:
+    await _send_file_to(update.get_bot(), update.effective_chat.id, path, caption)
+
+
+# In-memory store for inline-button payloads: Telegram caps callback_data at
+# 64 bytes, so buttons carry a short token that maps to the real payload here.
+# Lost on restart — stale buttons answer "expired".
+_CB_CACHE: dict[str, object] = {}
+
+
+def _cb_store(payload: object) -> str:
+    if len(_CB_CACHE) > 300:
+        for k in list(_CB_CACHE)[:100]:
+            _CB_CACHE.pop(k, None)
+    token = uuid.uuid4().hex[:12]
+    _CB_CACHE[token] = payload
+    return token
+
+
+_TGQ_RE = re.compile(r"^TGQUESTION:\s*(\{.*\})\s*$", re.MULTILINE)
+
+
+def _extract_tgquestion(text: str) -> tuple[str, dict | None]:
+    """Split off a trailing TGQUESTION marker (see _TGQ_SYSTEM_PROMPT)."""
+    m = None
+    for m in _TGQ_RE.finditer(text):
+        pass  # last occurrence wins
+    if m is None:
+        return text, None
+    try:
+        parsed = json.loads(m.group(1))
+        question = str(parsed.get("question") or "").strip()
+        options = [
+            str(o).strip()[:60] for o in (parsed.get("options") or []) if str(o).strip()
+        ]
+    except Exception:
+        return text, None
+    if not question or not (2 <= len(options) <= 6):
+        return text, None
+    stripped = (text[: m.start()] + text[m.end():]).strip()
+    return stripped, {"question": question, "options": options}
+
+
+def _mentioned_files(text: str) -> list[Path]:
+    """Existing workspace files referenced by absolute path in a reply."""
+    found: list[Path] = []
+    for raw in re.findall(re.escape(str(WORKSPACE_DIR)) + r"/[\w./\-]+", text):
+        resolved = _resolve_workspace_path(raw.rstrip(".,;:"))
+        if resolved and resolved.is_file() and resolved not in found:
+            found.append(resolved)
+        if len(found) >= 6:
+            break
+    return found
 
 
 async def send_md(bot, chat_id: int, text: str) -> None:
@@ -344,44 +433,62 @@ def _format_tool(tu: ToolUse) -> str:
     return f"🔧 {name}"
 
 
-async def claude_reply(update: Update, prompt: str) -> None:
-    """Ask Claude while updating a status message with live tool-use progress.
+async def run_claude_turn(bot, chat_id: int, uid: int, prompt: str) -> None:
+    """Run one Claude turn, streaming progress into a status message.
 
-    First edit fires immediately on the first tool; subsequent edits are
-    throttled to one per 1.5s to stay under Telegram's edit_message_text
-    rate limit. The status message is deleted once Claude returns and
-    the full response is sent via reply_md().
+    The status message shows the partial assistant text as it arrives (tail,
+    plain text) and the latest tool-use label; edits are throttled to one per
+    1.5s to stay under Telegram's edit rate limit. When Claude returns, the
+    status is deleted and the full reply is sent via send_md(), followed by
+    download buttons for any workspace files it mentions and inline-keyboard
+    rendering of a trailing TGQUESTION marker.
     """
-    uid = update.effective_user.id
     if claude.busy(uid):
-        status = await update.message.reply_text(
-            "📥 Queued — Claude is still working on the previous message…"
+        status = await bot.send_message(
+            chat_id=chat_id,
+            text="📥 Queued — Claude is still working on the previous message…",
         )
     else:
-        status = await update.message.reply_text("🤔 thinking…")
-    state = {"last_edit": 0.0}
+        status = await bot.send_message(chat_id=chat_id, text="🤔 thinking…")
+    state = {"last_edit": 0.0, "text": "", "tool": ""}
 
-    async def on_tool(tu: ToolUse) -> None:
+    async def _refresh() -> None:
         now = time.monotonic()
-        if state["last_edit"] != 0.0 and now - state["last_edit"] < 1.5:
+        if now - state["last_edit"] < 1.5:
             return
         state["last_edit"] = now
+        parts = []
+        if state["text"]:
+            tail = state["text"][-900:]
+            parts.append(("…" if len(state["text"]) > 900 else "") + tail)
+        if state["tool"]:
+            parts.append(state["tool"])
+        body = "\n\n".join(parts) or "🤔 thinking…"
         try:
-            await status.edit_text(_format_tool(tu))
+            await status.edit_text(body[:4000])
         except Exception as e:
             log.debug("progress edit failed: %s", e)
 
+    async def on_tool(tu: ToolUse) -> None:
+        state["tool"] = _format_tool(tu)
+        await _refresh()
+
+    async def on_text(chunk: str) -> None:
+        state["text"] = (state["text"] + "\n\n" + chunk).strip()
+        state["tool"] = ""
+        await _refresh()
+
     try:
-        resp = await claude.ask(uid, prompt, on_tool_use=on_tool)
+        resp = await claude.ask(uid, prompt, on_tool_use=on_tool, on_text=on_text)
     except ClaudeSessionError as e:
-        log.error("claude_reply: session error: %s", e)
+        log.error("claude turn: session error: %s", e)
         try:
             await status.edit_text(session_error_reply(e))
         except Exception:
             pass
         return
     except Exception as e:
-        log.exception("claude_reply: ask failed")
+        log.exception("claude turn: ask failed")
         try:
             await status.edit_text(f"Error: {e}")
         except Exception:
@@ -392,7 +499,43 @@ async def claude_reply(update: Update, prompt: str) -> None:
         await status.delete()
     except Exception:
         pass
-    await reply_md(update, resp)
+
+    resp, tgq = _extract_tgquestion(resp)
+    if resp or not tgq:
+        await send_md(bot, chat_id, resp)
+
+    files = _mentioned_files(resp)
+    if files:
+        keyboard = [
+            [InlineKeyboardButton(
+                f"📎 {p.name}"[:60],
+                callback_data=f"fget:{_cb_store(str(p))}",
+            )]
+            for p in files
+        ]
+        await bot.send_message(
+            chat_id=chat_id,
+            text="Mentioned files:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    if tgq:
+        token = _cb_store((tgq["question"], tgq["options"], chat_id, uid))
+        keyboard = [
+            [InlineKeyboardButton(opt, callback_data=f"tgq:{token}:{i}")]
+            for i, opt in enumerate(tgq["options"])
+        ]
+        await bot.send_message(
+            chat_id=chat_id,
+            text="❓ " + tgq["question"],
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+
+async def claude_reply(update: Update, prompt: str) -> None:
+    await run_claude_turn(
+        update.get_bot(), update.effective_chat.id, update.effective_user.id, prompt
+    )
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -410,6 +553,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/new - new conversation\n"
         "/cancel - kill the current Claude run\n"
         "/compact - compact context\n"
+        "/status - session, running state, costs\n"
         "/auth - check Claude auth status\n"
         "/login - paste Claude credentials\n"
         "/file <query> - retrieve files matching a query (Claude searches)\n"
@@ -488,6 +632,52 @@ async def cmd_compact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await status.edit_text("Context compacted into a fresh session.")
 
 
+BOT_STARTED = time.time()
+
+
+def _fmt_secs(s: float) -> str:
+    s = int(s)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s // 3600}h {(s % 3600) // 60}m"
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    info = claude.status_info()
+    lines = [
+        f"Auth: {'✅' if is_authed() else '❌ — use /login'}",
+        f"Model: {load_model()}",
+        f"Session: {info['session_id'] or 'none'}",
+    ]
+    if info["busy_since"]:
+        lines.append(f"Running: yes, for {_fmt_secs(time.time() - info['busy_since'])}")
+    else:
+        lines.append("Running: no")
+    last = info["last_result"]
+    if last:
+        parts = []
+        cost = transcript.cost_usd(last)
+        if cost is not None:
+            parts.append(f"${cost:.4f}")
+        dur = transcript.duration_ms(last)
+        if dur:
+            parts.append(_fmt_secs(dur / 1000))
+        usage = transcript.usage(last)
+        tok_in = usage.get("input_tokens")
+        tok_out = usage.get("output_tokens")
+        if tok_in is not None or tok_out is not None:
+            parts.append(f"{tok_in or 0}→{tok_out or 0} tok")
+        if parts:
+            lines.append("Last turn: " + ", ".join(parts))
+    lines.append(f"Session cost: ${info['total_cost_usd']:.4f}")
+    lines.append(f"Bot uptime: {_fmt_secs(time.time() - BOT_STARTED)}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
@@ -536,6 +726,52 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Current: {current}\nChoose a model:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+
+
+async def on_fget_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    if update.effective_user is None or update.effective_user.id != ALLOWED_USER:
+        await query.answer("Not authorized.")
+        return
+    token = query.data.split(":", 1)[1]
+    payload = _CB_CACHE.get(token)
+    if not isinstance(payload, str):
+        await query.answer("Expired — use /get <path>.")
+        return
+    await query.answer()
+    await _send_file_to(ctx.bot, update.effective_chat.id, Path(payload))
+
+
+async def on_tgq_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    if update.effective_user is None or update.effective_user.id != ALLOWED_USER:
+        await query.answer("Not authorized.")
+        return
+    try:
+        _, token, idx_raw = query.data.split(":")
+        idx = int(idx_raw)
+    except ValueError:
+        await query.answer("Bad data.")
+        return
+    payload = _CB_CACHE.pop(token, None)
+    if not isinstance(payload, tuple):
+        await query.answer("Expired — type your answer instead.")
+        return
+    question, options, chat_id, uid = payload
+    if not 0 <= idx < len(options):
+        await query.answer("Bad option.")
+        return
+    choice = options[idx]
+    await query.answer()
+    try:
+        await query.edit_message_text(f"❓ {question}\n➡️ {choice}")
+    except Exception:
+        pass
+    await run_claude_turn(ctx.bot, chat_id, uid, choice)
 
 
 async def on_model_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -879,6 +1115,7 @@ async def post_init(app: Application) -> None:
         BotCommand("new", "new conversation"),
         BotCommand("cancel", "kill the current Claude run"),
         BotCommand("compact", "compact context"),
+        BotCommand("status", "session, running state, costs"),
         BotCommand("auth", "check auth status"),
         BotCommand("login", "paste credentials"),
         BotCommand("file", "retrieve files matching a query"),
@@ -934,7 +1171,10 @@ def main() -> None:
     app.add_handler(CommandHandler("file", cmd_file))
     app.add_handler(CommandHandler("get", cmd_get))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(on_model_callback, pattern=r"^model:"))
+    app.add_handler(CallbackQueryHandler(on_fget_callback, pattern=r"^fget:"))
+    app.add_handler(CallbackQueryHandler(on_tgq_callback, pattern=r"^tgq:"))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
 
     if _openai_client is not None:

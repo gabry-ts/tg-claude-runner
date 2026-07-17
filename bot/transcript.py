@@ -51,6 +51,21 @@ def result_text(entry: dict) -> str:
     return (entry.get("result") or "").strip()
 
 
+def cost_usd(entry: dict) -> float | None:
+    v = entry.get("total_cost_usd")
+    return float(v) if isinstance(v, (int, float)) else None
+
+
+def duration_ms(entry: dict) -> int | None:
+    v = entry.get("duration_ms")
+    return int(v) if isinstance(v, (int, float)) else None
+
+
+def usage(entry: dict) -> dict:
+    u = entry.get("usage")
+    return u if isinstance(u, dict) else {}
+
+
 def extract_text(entry: dict) -> str:
     """Concatenate all text blocks of an assistant entry, ignoring thinking
     and tool_use. Returns "" if the entry has no text content.

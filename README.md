@@ -6,6 +6,11 @@ Telegram bot that wraps the [Claude Code](https://docs.claude.com/en/docs/claude
 
 - **Telegram bridge to Claude Code**: free-text messages are sent to Claude Code in headless print mode (`claude -p --output-format stream-json`). Each turn streams back the assistant text plus live tool-use events; the conversation is continued with `--resume <session_id>`, which also lets sessions survive bot restarts.
 - **Message queue**: messages sent while Claude is busy get an instant "📥 Queued" reply and run in order (best-effort FIFO) when the current turn finishes. `/cancel` kills the in-flight run; `/get`, `/auth`, `/login`, `/model` keep working while Claude is busy.
+- **Live streaming**: the status message is edited in place with the partial assistant text and the latest tool action as Claude works, so you watch the reply grow instead of staring at "thinking…".
+- **Inline questions**: when Claude needs you to pick between options, the choices arrive as Telegram inline buttons — tap one and the answer goes back to Claude as your next turn.
+- **File buttons**: workspace files mentioned in a reply get "📎" download buttons, no manual `/get` needed.
+- **`/status`**: auth state, active session, current run duration, last-turn cost/duration/tokens, cumulative session cost.
+- **Transient-error retry**: overloaded/5xx/network errors are retried automatically with backoff before you ever see them.
 - **MarkdownV2 rendering**: Claude's markdown output is auto-escaped to Telegram-safe MarkdownV2 (bold, italic, code, links, code blocks).
 - **Built-in scheduler**: `/schedule add "<cron>" <prompt>` registers a recurring job, persisted to `data/jobs.json`, restored on restart.
 - **Pre-installed CLIs**: `gh`, `git`, `curl`, `wget`, `jq`, `rsync`, `ssh`, `vim`, `nano`, `tree`, `zip/unzip`, plus `node`, `npm`, `python3`, `pip`.
@@ -152,6 +157,7 @@ sudo apt-get install -y postgresql-client redis-tools
 | `/login` | paste Claude credentials |
 | `/new` | reset Claude session |
 | `/cancel` | kill the current Claude run (queued messages still run) |
+| `/status` | auth, session, running state, costs |
 | `/compact` | compact context: summarize the session, then restart it seeded with the summary |
 | `/file <query>` | retrieve file(s) matching a description (Claude searches workspace, isolated session) |
 | `/get <path>` | send a single workspace file by path (no Claude call) |

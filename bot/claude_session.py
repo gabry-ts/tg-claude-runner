@@ -19,6 +19,7 @@ from typing import Awaitable, Callable
 from . import transcript
 
 ToolUseCallback = Callable[[transcript.ToolUse], Awaitable[None]]
+TextCallback = Callable[[str], Awaitable[None]]
 
 from .session_state import clear_state, load_state, save_state
 
@@ -61,13 +62,17 @@ class ClaudeSession:
         cwd: Path,
         model: str | None = None,
         persist_state: bool = True,
+        append_system_prompt: str | None = None,
     ) -> None:
         self.cwd = cwd
         self.model = model
+        self.append_system_prompt = append_system_prompt
         self._persist_state = persist_state
         self._session_id: str | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._cancel_requested = False
+        self.last_result: dict | None = None
+        self.total_cost_usd = 0.0
         if persist_state:
             self._load_session_id()
 
@@ -109,6 +114,8 @@ class ClaudeSession:
             cmd += ["--resume", resume_id]
         if self.model and self.model != "default":
             cmd += ["--model", self.model]
+        if self.append_system_prompt:
+            cmd += ["--append-system-prompt", self.append_system_prompt]
         return cmd
 
     async def _run_once(
@@ -117,6 +124,7 @@ class ClaudeSession:
         resume_id: str | None,
         timeout: float,
         on_tool_use: ToolUseCallback | None,
+        on_text: TextCallback | None,
     ) -> tuple[str, str | None]:
         cmd = self._build_cmd(resume_id)
         log.info("spawning claude -p (resume=%s, model=%s)", bool(resume_id), self.model)
@@ -169,6 +177,11 @@ class ClaudeSession:
                     chunk = transcript.extract_text(entry)
                     if chunk:
                         accumulated.append(chunk)
+                        if on_text:
+                            try:
+                                await on_text(chunk)
+                            except Exception as e:
+                                log.debug("on_text callback failed: %s", e)
                     if on_tool_use:
                         for tu in transcript.extract_tool_uses(entry):
                             try:
@@ -178,6 +191,10 @@ class ClaudeSession:
                 elif transcript.is_result(entry):
                     final_text = transcript.result_text(entry)
                     is_error = transcript.is_error_result(entry)
+                    self.last_result = entry
+                    cost = transcript.cost_usd(entry)
+                    if cost:
+                        self.total_cost_usd += cost
 
         self._proc = proc
         try:
@@ -217,18 +234,36 @@ class ClaudeSession:
         text: str,
         timeout: float = RESPONSE_TIMEOUT_S,
         on_tool_use: ToolUseCallback | None = None,
+        on_text: TextCallback | None = None,
     ) -> str:
         resume_id = self._session_id
-        try:
-            result, sid = await self._run_once(text, resume_id, timeout, on_tool_use)
-        except ClaudeSessionError as e:
-            # A stale or missing session id (e.g. after the workspace was wiped)
-            # makes --resume fail. Drop it and retry once from a fresh session.
-            if resume_id and self._looks_like_missing_session(str(e)):
-                log.warning("resume %s failed (%s); retrying fresh", resume_id, e)
-                self._session_id = None
-                result, sid = await self._run_once(text, None, timeout, on_tool_use)
-            else:
+        transient_tries = 0
+        while True:
+            try:
+                result, sid = await self._run_once(
+                    text, resume_id, timeout, on_tool_use, on_text
+                )
+                break
+            except ClaudeSessionError as e:
+                err = str(e)
+                # A stale or missing session id (e.g. after the workspace was
+                # wiped) makes --resume fail. Drop it and retry fresh.
+                if resume_id and self._looks_like_missing_session(err):
+                    log.warning("resume %s failed (%s); retrying fresh", resume_id, e)
+                    resume_id = None
+                    self._session_id = None
+                    continue
+                # Transient API/network errors (overloaded, 5xx, connection
+                # drops) are retried with backoff instead of surfacing.
+                if self._looks_transient(err) and transient_tries < 2:
+                    transient_tries += 1
+                    delay = 2 ** transient_tries
+                    log.warning(
+                        "transient error (%s); retry %d/2 in %ds",
+                        e, transient_tries, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 raise
         if sid:
             self._session_id = sid
@@ -243,6 +278,30 @@ class ClaudeSession:
             or "no session" in e
             or ("session" in e and "not found" in e)
             or ("resume" in e and "found" in e)
+        )
+
+    @staticmethod
+    def _looks_transient(err: str) -> bool:
+        e = err.lower()
+        if "cancelled by user" in e or "no response within" in e:
+            return False
+        return any(
+            m in e
+            for m in (
+                "overloaded",
+                "529",
+                "502",
+                "503",
+                "504",
+                "internal server error",
+                "econnreset",
+                "etimedout",
+                "econnrefused",
+                "fetch failed",
+                "network error",
+                "connection error",
+                "socket hang up",
+            )
         )
 
     def cancel_current(self) -> bool:
