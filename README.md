@@ -12,6 +12,9 @@ Telegram bot that wraps the [Claude Code](https://docs.claude.com/en/docs/claude
 - **`/status`**: auth state, active session, current run duration, last-turn cost/duration/tokens, cumulative session cost.
 - **Transient-error retry**: overloaded/5xx/network errors are retried automatically with backoff before you ever see them.
 - **Emoji reactions**: the bot reacts 👀 to your message when it starts working on it, 👍 when done, 💔 on failure — ambient feedback without extra chat noise.
+- **Reactions as commands**: react to a bot message with 👍 to tell Claude "go ahead", 👎 for "reconsider" (the reacted text is sent back as context), or ❤/🔥/💯 to save that message to `workspace/saved/` as a note.
+- **Image generation**: `/img <prompt>` generates an image via OpenAI (`gpt-image-1` by default, `IMAGE_MODEL` to change) and sends it as a photo.
+- **`/export`**: downloads the current session's transcript as a markdown file (user/assistant turns plus tool-use markers).
 - **MarkdownV2 rendering**: Claude's markdown output is auto-escaped to Telegram-safe MarkdownV2 (bold, italic, code, links, code blocks).
 - **Built-in scheduler**: `/schedule add "<cron>" <prompt>` registers a recurring job, persisted to `data/jobs.json`, restored on restart.
 - **Pre-installed CLIs**: `gh`, `git`, `curl`, `wget`, `jq`, `rsync`, `ssh`, `vim`, `nano`, `tree`, `zip/unzip`, plus `node`, `npm`, `python3`, `pip`.
@@ -160,6 +163,8 @@ sudo apt-get install -y postgresql-client redis-tools
 | `/cancel` | kill the current Claude run (queued messages still run) |
 | `/status` | auth, session, running state, costs |
 | `/logs [n]` | last n bot log lines (default 50, max 400) |
+| `/img <prompt>` | generate an image via OpenAI |
+| `/export` | download the session transcript as markdown |
 | `/compact` | compact context: summarize the session, then restart it seeded with the summary |
 | `/file <query>` | retrieve file(s) matching a description (Claude searches workspace, isolated session) |
 | `/get <path>` | send a single workspace file by path (no Claude call) |
@@ -196,6 +201,7 @@ If `OPENAI_API_KEY` is set in `.env`, voice and audio messages are transcribed v
 | `TGCR_TTS` | `1` | Spoken replies to voice messages (needs `OPENAI_API_KEY`); `0` disables |
 | `TTS_MODEL` | `gpt-4o-mini-tts` | OpenAI TTS model |
 | `TTS_VOICE` | `alloy` | OpenAI TTS voice |
+| `IMAGE_MODEL` | `gpt-image-1` | OpenAI image model for `/img` (e.g. `dall-e-3`) |
 | `TGCR_RESPONSE_TIMEOUT` | `0` | Max seconds to wait for a Claude reply per turn. `0` = no timeout: a turn runs until Claude finishes or `/cancel` kills it |
 | `TGCR_CLAUDE_BIN` | `claude` | Path to the Claude Code binary |
 

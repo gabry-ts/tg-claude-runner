@@ -6,9 +6,11 @@ import re
 import json
 import time
 import uuid
+import base64
 import asyncio
 import logging
 import tempfile
+from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict, deque
@@ -25,6 +27,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    MessageReactionHandler,
     filters,
     ContextTypes,
 )
@@ -75,6 +78,8 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
 TTS_ENABLED = bool(OPENAI_API_KEY) and os.environ.get("TGCR_TTS", "1") != "0"
 TTS_MODEL = os.environ.get("TTS_MODEL", "gpt-4o-mini-tts")
 TTS_VOICE = os.environ.get("TTS_VOICE", "alloy")
+IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "gpt-image-1")
+SAVED_DIR_NAME = "saved"
 
 if OPENAI_API_KEY:
     from openai import OpenAI
@@ -402,6 +407,19 @@ def _mentioned_files(text: str) -> list[Path]:
     return found
 
 
+# Text of recently sent bot messages, keyed by message_id, so reaction
+# handlers can recover what the user reacted to (reaction updates don't
+# carry the message content). Bounded; stale entries mean "too old".
+_SENT_CACHE: dict[int, str] = {}
+
+
+def _remember_sent(message_id: int, text: str) -> None:
+    if len(_SENT_CACHE) > 300:
+        for k in list(_SENT_CACHE)[:100]:
+            _SENT_CACHE.pop(k, None)
+    _SENT_CACHE[message_id] = text
+
+
 async def send_md(bot, chat_id: int, text: str) -> None:
     """Send text as MarkdownV2, falling back to plain per chunk.
 
@@ -417,16 +435,18 @@ async def send_md(bot, chat_id: int, text: str) -> None:
         converted = to_telegram_markdown(chunk)
         if len(converted) <= 4000:
             try:
-                await bot.send_message(
+                msg = await bot.send_message(
                     chat_id=chat_id,
                     text=converted,
                     parse_mode="MarkdownV2",
                     disable_web_page_preview=True,
                 )
+                _remember_sent(msg.message_id, chunk)
                 continue
             except Exception as e:
                 log.warning("MarkdownV2 send failed (%s); falling back to plain", e)
-        await bot.send_message(chat_id=chat_id, text=chunk)
+        msg = await bot.send_message(chat_id=chat_id, text=chunk)
+        _remember_sent(msg.message_id, chunk)
 
 
 async def reply_md(update: Update, text: str) -> None:
@@ -613,7 +633,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/login - paste Claude credentials\n"
         "/file <query> - retrieve files matching a query (Claude searches)\n"
         "/get <path> - send a workspace file by path (no Claude)\n"
+        "/img <prompt> - generate an image (OpenAI)\n"
+        "/export - download the session transcript\n"
         "/model [name] - show or set Claude model\n"
+        "React to my messages: 👍 go ahead, 👎 reconsider, ❤/🔥/💯 save to workspace/saved/\n"
         '/schedule add "<cron>" <prompt> - recurring prompt\n'
         "/schedule list - list jobs\n"
         "/schedule remove <id> - remove job\n"
@@ -1193,6 +1216,118 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await claude_reply(update, text)
 
 
+def _transcript_markdown(sid: str) -> str | None:
+    """Render the Claude Code session transcript jsonl as readable markdown."""
+    projects = CLAUDE_HOME / "projects"
+    if not projects.is_dir():
+        return None
+    matches = list(projects.glob(f"*/{sid}.jsonl"))
+    if not matches:
+        return None
+    sections: list[str] = []
+    for raw in matches[0].read_text(errors="replace").splitlines():
+        try:
+            entry = json.loads(raw)
+        except Exception:
+            continue
+        etype = entry.get("type")
+        message = entry.get("message") or {}
+        content = message.get("content")
+        if etype == "user":
+            if isinstance(content, str):
+                texts = [content]
+            else:
+                texts = [
+                    b.get("text", "")
+                    for b in (content or [])
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+            text = "\n".join(t for t in texts if t).strip()
+            if text:
+                sections.append("## 👤 User\n\n" + text)
+        elif etype == "assistant":
+            parts = []
+            for b in content or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text" and b.get("text"):
+                    parts.append(b["text"])
+                elif b.get("type") == "tool_use":
+                    parts.append(f"> 🔧 {b.get('name', 'tool')}")
+            text = "\n\n".join(parts).strip()
+            if text:
+                sections.append("## 🤖 Claude\n\n" + text)
+    if not sections:
+        return None
+    return f"# Session {sid}\n\n" + "\n\n---\n\n".join(sections) + "\n"
+
+
+async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    sid = claude.status_info()["session_id"]
+    if not sid:
+        await update.message.reply_text("No active session to export.")
+        return
+    doc = _transcript_markdown(sid)
+    if doc is None:
+        await update.message.reply_text(f"Transcript for session {sid} not found.")
+        return
+    buf = BytesIO(doc.encode())
+    buf.name = f"session-{sid[:8]}.md"
+    await update.message.reply_document(buf, filename=buf.name)
+
+
+async def _gen_image(prompt: str) -> bytes | str:
+    loop = asyncio.get_running_loop()
+
+    def _run() -> bytes | str:
+        params = {"model": IMAGE_MODEL, "prompt": prompt, "size": "1024x1024", "n": 1}
+        # dall-e models return a URL unless asked for b64; gpt-image-1 is
+        # always b64 and rejects the response_format param.
+        if IMAGE_MODEL.startswith("dall-e"):
+            params["response_format"] = "b64_json"
+        resp = _openai_client.images.generate(**params)
+        data = resp.data[0]
+        if getattr(data, "b64_json", None):
+            return base64.b64decode(data.b64_json)
+        return data.url
+
+    return await loop.run_in_executor(None, _run)
+
+
+async def cmd_img(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    if _openai_client is None:
+        await update.message.reply_text("Image generation needs OPENAI_API_KEY in .env.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /img <description of the image>")
+        return
+    prompt = " ".join(ctx.args).strip()
+    status = await update.message.reply_text("🎨 Generating image…")
+    try:
+        img = await _gen_image(prompt)
+    except Exception as e:
+        log.exception("image generation failed")
+        try:
+            await status.edit_text(f"Image generation failed: {e}")
+        except Exception:
+            pass
+        return
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    if isinstance(img, bytes):
+        buf = BytesIO(img)
+        buf.name = "image.png"
+        await update.message.reply_photo(buf, caption=prompt[:1000])
+    else:
+        await update.message.reply_photo(img, caption=prompt[:1000])
+
+
 async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
@@ -1207,7 +1342,6 @@ async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = "\n".join(lines)
     if len(text) > 3500:
-        from io import BytesIO
         buf = BytesIO(text.encode())
         buf.name = "bot.log"
         await update.message.reply_document(buf, filename="bot.log")
@@ -1221,6 +1355,65 @@ async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Unknown command. Use /help.")
 
 
+async def on_reaction(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """React-to-command: user reactions on the bot's own messages.
+
+    👍 = approve / go ahead, 👎 = not good / reconsider (both are fed back to
+    Claude with the reacted text as context); ❤/🔥/💯 = save that message to
+    workspace/saved/. Anything else is ignored.
+    """
+    mr = update.message_reaction
+    if mr is None or mr.user is None or mr.user.id != ALLOWED_USER:
+        return
+
+    def emojis(reactions) -> set[str]:
+        return {
+            getattr(r, "emoji", None)
+            for r in reactions
+            if getattr(r, "emoji", None)
+        }
+
+    added = emojis(mr.new_reaction) - emojis(mr.old_reaction)
+    if not added:
+        return
+    text = _SENT_CACHE.get(mr.message_id)
+    chat_id = mr.chat.id
+
+    if "👍" in added or "👎" in added:
+        if not is_authed():
+            await ctx.bot.send_message(
+                chat_id=chat_id, text="Claude not authenticated. Use /login."
+            )
+            return
+        excerpt = (text or "(message not cached — too old)")[:500]
+        if "👍" in added:
+            prompt = (
+                "The user reacted 👍 (approve / go ahead) to this message of "
+                f"yours:\n\n{excerpt}\n\nProceed accordingly."
+            )
+        else:
+            prompt = (
+                "The user reacted 👎 (not good / rejected) to this message of "
+                f"yours:\n\n{excerpt}\n\nReconsider and propose an alternative."
+            )
+        await run_claude_turn(ctx.bot, chat_id, mr.user.id, prompt)
+        return
+
+    if added & {"❤", "❤️", "🔥", "💯"}:
+        if not text:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text="Can't save: message too old (not in cache anymore).",
+            )
+            return
+        saved_dir = WORKSPACE_DIR / SAVED_DIR_NAME
+        saved_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        target = saved_dir / f"{stamp}.md"
+        target.write_text(text + "\n")
+        await ctx.bot.send_message(chat_id=chat_id, text=f"💾 Saved to {target}")
+
+
 async def post_init(app: Application) -> None:
     commands = [
         BotCommand("new", "new conversation"),
@@ -1228,6 +1421,8 @@ async def post_init(app: Application) -> None:
         BotCommand("compact", "compact context"),
         BotCommand("status", "session, running state, costs"),
         BotCommand("logs", "last bot log lines"),
+        BotCommand("img", "generate an image (OpenAI)"),
+        BotCommand("export", "download the session transcript"),
         BotCommand("auth", "check auth status"),
         BotCommand("login", "paste credentials"),
         BotCommand("file", "retrieve files matching a query"),
@@ -1285,6 +1480,9 @@ def main() -> None:
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("logs", cmd_logs))
+    app.add_handler(CommandHandler("img", cmd_img))
+    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(MessageReactionHandler(on_reaction))
     app.add_handler(CallbackQueryHandler(on_model_callback, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(on_fget_callback, pattern=r"^fget:"))
     app.add_handler(CallbackQueryHandler(on_tgq_callback, pattern=r"^tgq:"))
@@ -1306,7 +1504,8 @@ def main() -> None:
     # Last in the group: only fires for commands no CommandHandler matched.
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
 
-    app.run_polling(drop_pending_updates=True)
+    # ALL_TYPES so message_reaction updates are delivered (excluded by default).
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
