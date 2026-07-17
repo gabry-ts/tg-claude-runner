@@ -11,6 +11,7 @@ Telegram bot that wraps the [Claude Code](https://docs.claude.com/en/docs/claude
 - **File buttons**: workspace files mentioned in a reply get "📎" download buttons, no manual `/get` needed.
 - **`/status`**: auth state, active session, current run duration, last-turn cost/duration/tokens, cumulative session cost.
 - **Transient-error retry**: overloaded/5xx/network errors are retried automatically with backoff before you ever see them.
+- **Emoji reactions**: the bot reacts 👀 to your message when it starts working on it, 👍 when done, 💔 on failure — ambient feedback without extra chat noise.
 - **MarkdownV2 rendering**: Claude's markdown output is auto-escaped to Telegram-safe MarkdownV2 (bold, italic, code, links, code blocks).
 - **Built-in scheduler**: `/schedule add "<cron>" <prompt>` registers a recurring job, persisted to `data/jobs.json`, restored on restart.
 - **Pre-installed CLIs**: `gh`, `git`, `curl`, `wget`, `jq`, `rsync`, `ssh`, `vim`, `nano`, `tree`, `zip/unzip`, plus `node`, `npm`, `python3`, `pip`.
@@ -158,6 +159,7 @@ sudo apt-get install -y postgresql-client redis-tools
 | `/new` | reset Claude session |
 | `/cancel` | kill the current Claude run (queued messages still run) |
 | `/status` | auth, session, running state, costs |
+| `/logs [n]` | last n bot log lines (default 50, max 400) |
 | `/compact` | compact context: summarize the session, then restart it seeded with the summary |
 | `/file <query>` | retrieve file(s) matching a description (Claude searches workspace, isolated session) |
 | `/get <path>` | send a single workspace file by path (no Claude call) |
@@ -180,6 +182,8 @@ Notes:
 
 If `OPENAI_API_KEY` is set in `.env`, voice and audio messages are transcribed via OpenAI Whisper and forwarded to Claude as if you typed them. The bot replies with the transcription (so you can verify) followed by Claude's answer. Without the key, voice messages are silently ignored.
 
+**Voice in, voice out:** when you send a voice message, the reply is also spoken back as a Telegram voice note via OpenAI TTS (markdown/code is stripped before synthesis). Disable with `TGCR_TTS=0`; tune with `TTS_MODEL` / `TTS_VOICE`.
+
 ## Configuration
 
 | Env var | Default | Description |
@@ -189,6 +193,9 @@ If `OPENAI_API_KEY` is set in `.env`, voice and audio messages are transcribed v
 | `CLAUDE_BOT_HOME` | `${HOME}/claude_bot` | Host folder bind-mounted at `/home/node` |
 | `OPENAI_API_KEY` | (unset) | If set, enables Whisper transcription of voice/audio messages |
 | `WHISPER_MODEL` | `whisper-1` | Whisper model to use |
+| `TGCR_TTS` | `1` | Spoken replies to voice messages (needs `OPENAI_API_KEY`); `0` disables |
+| `TTS_MODEL` | `gpt-4o-mini-tts` | OpenAI TTS model |
+| `TTS_VOICE` | `alloy` | OpenAI TTS voice |
 | `TGCR_RESPONSE_TIMEOUT` | `0` | Max seconds to wait for a Claude reply per turn. `0` = no timeout: a turn runs until Claude finishes or `/cancel` kills it |
 | `TGCR_CLAUDE_BIN` | `claude` | Path to the Claude Code binary |
 

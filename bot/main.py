@@ -11,9 +11,15 @@ import logging
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, deque
 
-from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReactionTypeEmoji,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -35,6 +41,25 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-claude-runner")
 
+
+class _RingHandler(logging.Handler):
+    """Keeps the last N log lines in memory so /logs can serve them."""
+
+    def __init__(self, capacity: int = 400) -> None:
+        super().__init__()
+        self.buf: deque[str] = deque(maxlen=capacity)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.buf.append(self.format(record))
+        except Exception:
+            pass
+
+
+_ring = _RingHandler()
+_ring.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logging.getLogger().addHandler(_ring)
+
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USER = int(os.environ["TELEGRAM_ALLOWED_USER"])
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -47,6 +72,9 @@ MODEL_CHOICES = ["default", "sonnet", "opus", "haiku"]
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
+TTS_ENABLED = bool(OPENAI_API_KEY) and os.environ.get("TGCR_TTS", "1") != "0"
+TTS_MODEL = os.environ.get("TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.environ.get("TTS_VOICE", "alloy")
 
 if OPENAI_API_KEY:
     from openai import OpenAI
@@ -433,7 +461,23 @@ def _format_tool(tu: ToolUse) -> str:
     return f"🔧 {name}"
 
 
-async def run_claude_turn(bot, chat_id: int, uid: int, prompt: str) -> None:
+async def _react(bot, chat_id: int, message_id: int | None, emoji: str | None) -> None:
+    """Best-effort reaction on the user's message (👀 working, 👍 done, 💔 error)."""
+    if message_id is None:
+        return
+    try:
+        await bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji)] if emoji else [],
+        )
+    except Exception as e:
+        log.debug("reaction failed: %s", e)
+
+
+async def run_claude_turn(
+    bot, chat_id: int, uid: int, prompt: str, react_to: int | None = None
+) -> str | None:
     """Run one Claude turn, streaming progress into a status message.
 
     The status message shows the partial assistant text as it arrives (tail,
@@ -443,6 +487,7 @@ async def run_claude_turn(bot, chat_id: int, uid: int, prompt: str) -> None:
     download buttons for any workspace files it mentions and inline-keyboard
     rendering of a trailing TGQUESTION marker.
     """
+    await _react(bot, chat_id, react_to, "👀")
     if claude.busy(uid):
         status = await bot.send_message(
             chat_id=chat_id,
@@ -482,18 +527,20 @@ async def run_claude_turn(bot, chat_id: int, uid: int, prompt: str) -> None:
         resp = await claude.ask(uid, prompt, on_tool_use=on_tool, on_text=on_text)
     except ClaudeSessionError as e:
         log.error("claude turn: session error: %s", e)
+        await _react(bot, chat_id, react_to, "💔")
         try:
             await status.edit_text(session_error_reply(e))
         except Exception:
             pass
-        return
+        return None
     except Exception as e:
         log.exception("claude turn: ask failed")
+        await _react(bot, chat_id, react_to, "💔")
         try:
             await status.edit_text(f"Error: {e}")
         except Exception:
             pass
-        return
+        return None
 
     try:
         await status.delete()
@@ -531,10 +578,17 @@ async def run_claude_turn(bot, chat_id: int, uid: int, prompt: str) -> None:
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
+    await _react(bot, chat_id, react_to, "👍")
+    return resp
 
-async def claude_reply(update: Update, prompt: str) -> None:
-    await run_claude_turn(
-        update.get_bot(), update.effective_chat.id, update.effective_user.id, prompt
+
+async def claude_reply(update: Update, prompt: str) -> str | None:
+    return await run_claude_turn(
+        update.get_bot(),
+        update.effective_chat.id,
+        update.effective_user.id,
+        prompt,
+        react_to=update.message.message_id if update.message else None,
     )
 
 
@@ -554,6 +608,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/cancel - kill the current Claude run\n"
         "/compact - compact context\n"
         "/status - session, running state, costs\n"
+        "/logs [n] - last n bot log lines\n"
         "/auth - check Claude auth status\n"
         "/login - paste Claude credentials\n"
         "/file <query> - retrieve files matching a query (Claude searches)\n"
@@ -1025,6 +1080,30 @@ async def _transcribe(audio_path: Path) -> str:
     return await loop.run_in_executor(None, _run)
 
 
+def _speakable(text: str) -> str:
+    """Strip markdown noise that sounds terrible when read aloud."""
+    text = re.sub(r"```.*?```", " (codice) ", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`\n]+)`", r"\1", text)
+    text = re.sub(r"\[([^\]\n]+)\]\([^)\n]+\)", r"\1", text)
+    text = re.sub(r"[*_#~]+", "", text)
+    return re.sub(r"\n{2,}", "\n", text).strip()
+
+
+async def _tts(text: str) -> bytes:
+    loop = asyncio.get_running_loop()
+
+    def _run() -> bytes:
+        resp = _openai_client.audio.speech.create(
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
+            input=text[:4000],
+            response_format="opus",
+        )
+        return resp.content
+
+    return await loop.run_in_executor(None, _run)
+
+
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
@@ -1064,7 +1143,17 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Claude not authenticated. Use /login.")
             return
 
-        await claude_reply(update, transcribed)
+        resp = await claude_reply(update, transcribed)
+
+        # Voice in, voice out: speak the reply too (TGCR_TTS=0 disables).
+        if resp and TTS_ENABLED:
+            spoken = _speakable(resp)
+            if spoken:
+                try:
+                    audio = await _tts(spoken)
+                    await update.message.reply_voice(audio)
+                except Exception as e:
+                    log.warning("TTS failed: %s", e)
     finally:
         try:
             tmp_path.unlink()
@@ -1104,6 +1193,28 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await claude_reply(update, text)
 
 
+async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    try:
+        n = max(1, min(int(ctx.args[0]), 400)) if ctx.args else 50
+    except ValueError:
+        await update.message.reply_text("Usage: /logs [n]  (1-400, default 50)")
+        return
+    lines = list(_ring.buf)[-n:]
+    if not lines:
+        await update.message.reply_text("No logs yet.")
+        return
+    text = "\n".join(lines)
+    if len(text) > 3500:
+        from io import BytesIO
+        buf = BytesIO(text.encode())
+        buf.name = "bot.log"
+        await update.message.reply_document(buf, filename="bot.log")
+    else:
+        await update.message.reply_text(text)
+
+
 async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
@@ -1116,6 +1227,7 @@ async def post_init(app: Application) -> None:
         BotCommand("cancel", "kill the current Claude run"),
         BotCommand("compact", "compact context"),
         BotCommand("status", "session, running state, costs"),
+        BotCommand("logs", "last bot log lines"),
         BotCommand("auth", "check auth status"),
         BotCommand("login", "paste credentials"),
         BotCommand("file", "retrieve files matching a query"),
@@ -1172,6 +1284,7 @@ def main() -> None:
     app.add_handler(CommandHandler("get", cmd_get))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("logs", cmd_logs))
     app.add_handler(CallbackQueryHandler(on_model_callback, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(on_fget_callback, pattern=r"^fget:"))
     app.add_handler(CallbackQueryHandler(on_tgq_callback, pattern=r"^tgq:"))
