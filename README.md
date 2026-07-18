@@ -5,12 +5,14 @@ Telegram bot that wraps the [Claude Code](https://docs.claude.com/en/docs/claude
 ## What you get
 
 - **Telegram bridge to Claude Code**: free-text messages are sent to Claude Code in headless print mode (`claude -p --output-format stream-json`). Each turn streams back the assistant text plus live tool-use events; the conversation is continued with `--resume <session_id>`, which also lets sessions survive bot restarts.
+- **Named sessions**: `/session work` switches to (or creates) a separate conversation; `/session` lists them with one-tap switch buttons, `/session del <name>` deletes one. Each named session keeps its own `--resume` id, so contexts never bleed into each other; `/new` resets only the current one.
+- **Proactive messages from Claude**: any file dropped into `workspace/.notify/` is delivered to your chat within seconds and deleted. Claude is told about this in its system prompt, so it can set up background scripts or cron jobs that ping you on their own ("the deploy finished", "disk almost full").
 - **Message queue**: messages sent while Claude is busy get an instant "📥 Queued" reply and run in order (best-effort FIFO) when the current turn finishes. `/cancel` kills the in-flight run (queued messages still run — repeat `/cancel` to kill the next one); all other commands (`/get`, `/status`, `/logs`, `/auth`, `/login`, `/model`, …) keep working while Claude is busy.
 - **Live streaming**: the status message is edited in place with the partial assistant text and the latest tool action as Claude works, so you watch the reply grow instead of staring at "thinking…".
 - **Inline questions**: when Claude needs you to pick between options, the choices arrive as Telegram inline buttons — tap one and the answer goes back to Claude as your next turn. (Under the hood a system prompt teaches Claude to end such replies with a `TGQUESTION: {...}` JSON marker; the bot strips it and renders 2–6 option buttons. Buttons live in an in-memory cache, so they expire on bot restart.)
 - **File buttons**: workspace files mentioned in a reply get "📎" download buttons, no manual `/get` needed.
 - **`/status`**: auth state, selected model, active session, current run duration, last-turn cost/duration/tokens, cumulative session cost, bot uptime.
-- **`/model`**: show or switch the Claude model (`default`, `sonnet`, `opus`, `haiku`) via inline buttons; persisted to `data/model.json`. Switching models resets the session.
+- **`/model`**: switch the Claude model via inline buttons — aliases (`opus`, `sonnet`, `haiku`, `opusplan`) that track the latest version plus pinned IDs (Sonnet 5, Opus 4.8, Haiku 4.5); `/model <name>` accepts any model id as a free-text escape hatch. Persisted to `data/model.json`; switching models resets the session.
 - **Transient-error retry**: overloaded/5xx/network errors are retried automatically with backoff before you ever see them.
 - **Emoji reactions**: the bot reacts 👀 to your message when it starts working on it, 👍 when done, 💔 on failure — ambient feedback without extra chat noise.
 - **Reactions as commands**: react to a bot message with 👍 to tell Claude "go ahead", 👎 for "reconsider" (the reacted text is sent back as context), or ❤/🔥/💯 to save that message to `workspace/saved/` as a note. The bot keeps the text of only the last ~30 sent messages in memory — reacting to anything older (or sent before a restart) gets a "too old" response.
@@ -108,9 +110,12 @@ Standard 5-field cron (`min hour dom month dow`). Quote the cron expression:
 ```
 /schedule add "0 9 * * *" Send me a morning summary using my notes
 /schedule add "*/30 * * * *" Check for new emails
+/schedule add "0 8 * * *" model=haiku Quick weather check
 /schedule list
 /schedule remove abc12345
 ```
+
+Cron times are evaluated in **Europe/Rome** by default (DST-aware); set `TGCR_TZ` to change the timezone. An optional `model=<name>` right after the cron runs that job on a specific model (e.g. `haiku` for cheap frequent checks) without touching your chat model.
 
 Each fire runs in an **isolated one-shot session** (no `--resume`), so scheduled jobs never pollute your interactive chat context.
 
@@ -162,7 +167,9 @@ sudo apt-get install -y postgresql-client redis-tools
 | `/help` | list commands |
 | `/auth` | check Claude auth status |
 | `/login` | paste Claude credentials |
-| `/new` | reset Claude session |
+| `/new` | reset the current Claude session |
+| `/session [name]` | list named sessions (buttons) / switch or create one |
+| `/session del <name>` | delete a named session |
 | `/cancel` | kill the current Claude run (queued messages still run) |
 | `/status` | auth, model, session, running state, costs |
 | `/logs [n]` | last n bot log lines (default 50, max 400) |
@@ -208,7 +215,8 @@ If `OPENAI_API_KEY` is set in `.env`, voice and audio messages are transcribed v
 | `IMAGE_MODEL` | `gpt-image-1` | OpenAI image model for `/img` (e.g. `dall-e-3`) |
 | `TGCR_RESPONSE_TIMEOUT` | `0` | Max seconds to wait for a Claude reply per turn. `0` = no timeout: a turn runs until Claude finishes or `/cancel` kills it |
 | `TGCR_CLAUDE_BIN` | `claude` | Path to the Claude Code binary |
-| `TGCR_STATE_DIR` | `~/.tg-claude-runner` | Where `state.json` (resumable session id) is kept |
+| `TGCR_STATE_DIR` | `~/.tg-claude-runner` | Where `state.json` (named-session resume ids + current session) is kept |
+| `TGCR_TZ` | `Europe/Rome` | Timezone for `/schedule` cron evaluation (falls back to `TZ`, then UTC if invalid) |
 
 ## Layout
 

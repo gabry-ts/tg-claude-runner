@@ -762,13 +762,14 @@ def test_cmd_status_output(monkeypatch):
         },
         total_cost_usd=0.5,
     )
-    monkeypatch.setattr(main.claude, "_main", fake_session)
+    monkeypatch.setattr(main.claude, "_sessions", {"main": fake_session})
+    monkeypatch.setattr(main.claude, "_current", "main")
     upd = make_update(bot, text="/status")
     asyncio.run(main.cmd_status(upd, make_ctx(bot)))
     text = upd.message.replies[0]
     assert "Auth: ❌ — use /login" in text  # no creds file
     assert "Model: default" in text
-    assert "Session: sess-42" in text
+    assert "Session: main (sess-42)" in text
     assert "Running: no" in text
     assert "Last turn: $0.1234, 2s, 10→20 tok" in text
     assert "Session cost: $0.5000" in text
@@ -777,11 +778,12 @@ def test_cmd_status_output(monkeypatch):
 
 def test_cmd_status_no_session(monkeypatch):
     bot = FakeBot()
-    monkeypatch.setattr(main.claude, "_main", None)
+    monkeypatch.setattr(main.claude, "_sessions", {})
+    monkeypatch.setattr(main.claude, "_current", "main")
     upd = make_update(bot, text="/status")
     asyncio.run(main.cmd_status(upd, make_ctx(bot)))
     text = upd.message.replies[0]
-    assert "Session: none" in text
+    assert "Session: main (no id yet)" in text
     assert "Session cost: $0.0000" in text
 
 
@@ -974,7 +976,8 @@ def _fake_session(sid):
 
 def test_cmd_export_no_session(monkeypatch):
     bot = FakeBot()
-    monkeypatch.setattr(main.claude, "_main", None)
+    monkeypatch.setattr(main.claude, "_sessions", {})
+    monkeypatch.setattr(main.claude, "_current", "main")
     upd = make_update(bot, text="/export")
     asyncio.run(main.cmd_export(upd, make_ctx(bot)))
     assert upd.message.replies == ["No active session to export."]
@@ -982,7 +985,10 @@ def test_cmd_export_no_session(monkeypatch):
 
 def test_cmd_export_transcript_missing(monkeypatch):
     bot = FakeBot()
-    monkeypatch.setattr(main.claude, "_main", _fake_session("no-such-session"))
+    monkeypatch.setattr(
+        main.claude, "_sessions", {"main": _fake_session("no-such-session")}
+    )
+    monkeypatch.setattr(main.claude, "_current", "main")
     (main.CLAUDE_HOME / "projects" / "p").mkdir(parents=True, exist_ok=True)
     upd = make_update(bot, text="/export")
     asyncio.run(main.cmd_export(upd, make_ctx(bot)))
@@ -1020,7 +1026,8 @@ def test_cmd_export_sends_transcript_document(monkeypatch):
         lines.append(e if isinstance(e, str) else json.dumps(e))
     (proj / f"{sid}.jsonl").write_text("\n".join(lines) + "\n")
 
-    monkeypatch.setattr(main.claude, "_main", _fake_session(sid))
+    monkeypatch.setattr(main.claude, "_sessions", {"main": _fake_session(sid)})
+    monkeypatch.setattr(main.claude, "_current", "main")
     upd = make_update(bot, text="/export")
     asyncio.run(main.cmd_export(upd, make_ctx(bot)))
     assert len(upd.message.documents) == 1

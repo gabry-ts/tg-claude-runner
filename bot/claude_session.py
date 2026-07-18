@@ -25,6 +25,19 @@ from .session_state import clear_state, load_state, save_state
 
 log = logging.getLogger(__name__)
 
+
+def sessions_in_state(state: dict) -> dict:
+    """Named-session dict from persisted state, migrating the legacy
+    single-session flat shape ({session_id, cwd, model}) to {'main': {...}}."""
+    sessions = state.get("sessions")
+    if isinstance(sessions, dict):
+        return sessions
+    if state.get("session_id"):
+        return {
+            "main": {k: state.get(k) for k in ("session_id", "cwd", "model")}
+        }
+    return {}
+
 CLAUDE_BIN = os.environ.get("TGCR_CLAUDE_BIN", "claude")
 # 0 (default) = no timeout: a turn runs until claude finishes or /cancel kills it.
 RESPONSE_TIMEOUT_S = float(os.environ.get("TGCR_RESPONSE_TIMEOUT", "0"))
@@ -63,11 +76,13 @@ class ClaudeSession:
         model: str | None = None,
         persist_state: bool = True,
         append_system_prompt: str | None = None,
+        state_key: str = "main",
     ) -> None:
         self.cwd = cwd
         self.model = model
         self.append_system_prompt = append_system_prompt
         self._persist_state = persist_state
+        self._state_key = state_key
         self._session_id: str | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._cancel_requested = False
@@ -81,25 +96,31 @@ class ClaudeSession:
         return self._session_id
 
     def _load_session_id(self) -> None:
-        saved = load_state()
+        entry = sessions_in_state(load_state()).get(self._state_key) or {}
         if (
-            saved.get("session_id")
-            and saved.get("cwd") == str(self.cwd)
-            and saved.get("model") == self.model
+            entry.get("session_id")
+            and entry.get("cwd") == str(self.cwd)
+            and entry.get("model") == self.model
         ):
-            self._session_id = saved["session_id"]
-            log.info("loaded persisted session %s", self._session_id)
+            self._session_id = entry["session_id"]
+            log.info(
+                "loaded persisted session %s (%s)", self._session_id, self._state_key
+            )
 
     def _save_session_id(self) -> None:
         if not self._persist_state:
             return
-        save_state(
-            {
-                "session_id": self._session_id,
-                "cwd": str(self.cwd),
-                "model": self.model,
-            }
-        )
+        state = load_state()
+        sessions = sessions_in_state(state)
+        sessions[self._state_key] = {
+            "session_id": self._session_id,
+            "cwd": str(self.cwd),
+            "model": self.model,
+        }
+        for legacy in ("session_id", "cwd", "model"):
+            state.pop(legacy, None)
+        state["sessions"] = sessions
+        save_state(state)
 
     def _build_cmd(self, resume_id: str | None) -> list[str]:
         cmd = [
@@ -318,7 +339,19 @@ class ClaudeSession:
 
     async def reset(self) -> None:
         self._session_id = None
-        if self._persist_state:
+        if not self._persist_state:
+            return
+        state = load_state()
+        sessions = sessions_in_state(state)
+        sessions.pop(self._state_key, None)
+        for legacy in ("session_id", "cwd", "model"):
+            state.pop(legacy, None)
+        state.pop("sessions", None)
+        if sessions:
+            state["sessions"] = sessions
+        if state:
+            save_state(state)
+        else:
             clear_state()
 
     async def kill(self) -> None:

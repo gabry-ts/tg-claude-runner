@@ -145,7 +145,7 @@ class RecordingRunner:
         self.calls = []
         self.exc = exc
 
-    async def __call__(self, prompt, chat_id, uid):
+    async def __call__(self, prompt, chat_id, uid, model=None):
         self.calls.append((prompt, chat_id, uid))
         if self.exc is not None:
             raise self.exc

@@ -236,29 +236,18 @@ class TestTokenPlaceholders:
         out = to_telegram_markdown("plain text only, no markup")
         assert not _has_token(out)
 
-    @pytest.mark.xfail(
-        reason="BUG: single-pass token expansion leaks \\x00T#\\x00 "
-        "placeholders for nested constructs (bold containing inline code)",
-        strict=True,
-    )
     def test_bold_containing_inline_code_no_leak(self):
         out = to_telegram_markdown("**bold `code`**")
         assert not _has_token(out)
         assert out == "*bold `code`*"
 
-    @pytest.mark.xfail(
-        reason="BUG: single-pass token expansion leaks \\x00T#\\x00 "
-        "placeholders for nested constructs (heading containing bold)",
-        strict=True,
-    )
     def test_heading_containing_bold_no_leak(self):
+        # Expansion is recursive; the doubled markers may still be rejected by
+        # Telegram, in which case the per-chunk plain fallback handles it —
+        # what matters here is that no NUL placeholder reaches the output.
         out = to_telegram_markdown("# **Title**")
         assert not _has_token(out)
-
-    def test_nested_leak_current_behavior_documented(self):
-        # Documents today's (buggy) output so a future fix flips the xfails.
-        assert to_telegram_markdown("**bold `code`**") == "*bold \x00T0\x00*"
-        assert to_telegram_markdown("# **Title**") == "*\x00T0\x00*"
+        assert "Title" in out
 
 
 # ---------------------------------------------------------------------------

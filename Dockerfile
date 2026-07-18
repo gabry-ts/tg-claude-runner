@@ -3,7 +3,7 @@ FROM node:20-slim
 # Base system tooling.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
-    curl wget jq gosu git ca-certificates sudo \
+    curl wget jq gosu git ca-certificates sudo tzdata \
     openssh-client rsync zip unzip tree less vim nano \
     tmux \
     && rm -rf /var/lib/apt/lists/*

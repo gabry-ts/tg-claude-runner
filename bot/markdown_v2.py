@@ -109,8 +109,15 @@ def to_telegram_markdown(text: str) -> str:
             out.append(_escape_special(p))
     text = ''.join(out)
 
-    # 9. Expand tokens
-    text = _TOKEN_RE.sub(lambda m: tokens[int(m.group(1))], text)
+    # 9. Expand tokens. Constructs can nest (bold containing inline code,
+    # heading containing bold), leaving a token inside another token's text —
+    # keep expanding until none remain (bounded: nesting is at most a few
+    # levels deep, and a stale pass means an unknown placeholder we bail on).
+    for _ in range(10):
+        expanded = _TOKEN_RE.sub(lambda m: tokens[int(m.group(1))], text)
+        if expanded == text:
+            break
+        text = expanded
 
     return text
 

@@ -1,5 +1,6 @@
 """Persistent recurring job scheduler backed by python-telegram-bot's JobQueue."""
 
+import os
 import json
 import time
 import uuid
@@ -7,13 +8,26 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
+from zoneinfo import ZoneInfo
 
 from croniter import croniter
 from telegram.ext import ContextTypes, JobQueue
 
 log = logging.getLogger(__name__)
 
-Runner = Callable[[str, int, int], Awaitable[None]]
+Runner = Callable[[str, int, int, str | None], Awaitable[None]]
+
+
+def _sched_tz():
+    name = os.environ.get("TGCR_TZ") or os.environ.get("TZ") or "Europe/Rome"
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        log.warning("Unknown timezone %r; scheduling in UTC", name)
+        return timezone.utc
+
+
+SCHED_TZ = _sched_tz()
 
 
 class Scheduler:
@@ -39,7 +53,7 @@ class Scheduler:
 
     def _schedule_next(self, job: dict) -> None:
         try:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(SCHED_TZ)
             it = croniter(job["cron"], now)
             next_time = it.get_next(datetime)
             delay = max(1, int((next_time - now).total_seconds()))
@@ -60,12 +74,21 @@ class Scheduler:
         if not job:
             return
         try:
-            await self._runner(job["prompt"], job["chat_id"], job["uid"])
+            await self._runner(
+                job["prompt"], job["chat_id"], job["uid"], job.get("model")
+            )
         except Exception as e:
             log.exception("Scheduled job %s failed: %s", job_id, e)
         self._schedule_next(job)
 
-    def add(self, cron: str, prompt: str, chat_id: int, uid: int) -> str:
+    def add(
+        self,
+        cron: str,
+        prompt: str,
+        chat_id: int,
+        uid: int,
+        model: str | None = None,
+    ) -> str:
         try:
             croniter(cron)
         except Exception as e:
@@ -77,6 +100,7 @@ class Scheduler:
             "prompt": prompt,
             "chat_id": chat_id,
             "uid": uid,
+            "model": model,
             "created": int(time.time()),
         }
         self._jobs.append(job)

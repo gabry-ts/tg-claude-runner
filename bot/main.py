@@ -34,7 +34,13 @@ from telegram.ext import (
 
 from .markdown_v2 import to_telegram_markdown, split_for_telegram
 from .scheduler import Scheduler
-from .claude_session import ClaudeSession, ClaudeSessionError, ToolUseCallback
+from .claude_session import (
+    ClaudeSession,
+    ClaudeSessionError,
+    ToolUseCallback,
+    sessions_in_state,
+)
+from .session_state import load_state, save_state
 from . import transcript
 from .transcript import ToolUse
 
@@ -71,7 +77,23 @@ CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", "/home/node/.claude"))
 CLAUDE_CREDS = CLAUDE_HOME / ".credentials.json"
 JOBS_FILE = DATA_DIR / "jobs.json"
 MODEL_FILE = DATA_DIR / "model.json"
-MODEL_CHOICES = ["default", "sonnet", "opus", "haiku"]
+CHAT_FILE = DATA_DIR / "chat.json"
+# (label shown on the Telegram button, value passed to `claude --model`).
+# Aliases track the latest version; full IDs pin one. Free text via
+# `/model <name>` is also accepted for anything not listed.
+MODEL_CHOICES = [
+    ("default", "default"),
+    ("Opus", "opus"),
+    ("Sonnet", "sonnet"),
+    ("Haiku", "haiku"),
+    ("Opus Plan", "opusplan"),
+    ("Sonnet 5", "claude-sonnet-5"),
+    ("Opus 4.8", "claude-opus-4-8"),
+    ("Haiku 4.5", "claude-haiku-4-5-20251001"),
+]
+MODEL_VALUES = [v for _, v in MODEL_CHOICES]
+_MODEL_NAME_RE = re.compile(r"^[\w.\-\[\]]{1,64}$")
+_SESSION_NAME_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
@@ -114,41 +136,120 @@ _TGQ_SYSTEM_PROMPT = (
     "genuinely needed. Open-ended questions stay normal text."
 )
 
+# Gives Claude a way to take initiative: anything dropped into the notify
+# inbox is delivered to the user's Telegram chat by the bot (see check_notify).
+_PROACTIVE_PROMPT = (
+    "Proactive messages: to send the user a Telegram message outside the "
+    "current conversation (from a background process, a cron job, or a script "
+    f"you set up), write a small text/markdown file into {WORKSPACE_DIR}/.notify/ "
+    "— the bot delivers its content to the user within seconds and deletes "
+    "the file."
+)
+
+_SYSTEM_APPENDIX = _TGQ_SYSTEM_PROMPT + "\n\n" + _PROACTIVE_PROMPT
+
 
 class ClaudeRunner:
-    """Single persistent Claude Code conversation driven via `claude -p`.
+    """Named persistent Claude Code conversations driven via `claude -p`.
 
-    Single-user bot: one main session for chat, ephemeral sessions for
-    isolated lookups (see ask_isolated()). Lock per uid is kept for API
-    compatibility even though we currently only allow ALLOWED_USER.
+    Single-user bot: any number of named sessions (default "main") with one
+    current at a time, plus ephemeral sessions for isolated lookups (see
+    ask_isolated()). Lock per uid is kept for API compatibility even though
+    we currently only allow ALLOWED_USER.
     """
 
     def __init__(self) -> None:
         self._locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self._main: ClaudeSession | None = None
+        self._sessions: dict[str, ClaudeSession] = {}
         self._busy_since: float | None = None
+        current = load_state().get("current")
+        self._current = (
+            current
+            if isinstance(current, str) and _SESSION_NAME_RE.match(current)
+            else "main"
+        )
+
+    @property
+    def current_name(self) -> str:
+        return self._current
 
     def _wanted_model(self) -> str | None:
         m = load_model()
         return None if m == "default" else m
 
+    def _get_session(self, name: str) -> ClaudeSession:
+        sess = self._sessions.get(name)
+        if sess is None:
+            sess = ClaudeSession(
+                cwd=WORKSPACE_DIR,
+                model=self._wanted_model(),
+                persist_state=True,
+                append_system_prompt=_SYSTEM_APPENDIX,
+                state_key=name,
+            )
+            self._sessions[name] = sess
+        return sess
+
+    def session_names(self) -> list[str]:
+        names = set(self._sessions) | {self._current, "main"}
+        names |= set(sessions_in_state(load_state()))
+        return sorted(names)
+
+    def _persist_current(self) -> None:
+        state = load_state()
+        state["current"] = self._current
+        save_state(state)
+
+    async def switch(self, uid: int, name: str) -> None:
+        async with self._locks[uid]:
+            self._current = name
+            self._persist_current()
+
+    async def delete(self, uid: int, name: str) -> bool:
+        async with self._locks[uid]:
+            sess = self._sessions.pop(name, None)
+            state = load_state()
+            # A just-switched-to session may have no persisted turns yet but
+            # still "exists" from the user's point of view.
+            existed = (
+                sess is not None
+                or name in sessions_in_state(state)
+                or name == self._current
+            )
+            if sess is not None:
+                await sess.reset()  # clears its persisted entry too
+            else:
+                sessions = sessions_in_state(state)
+                if name in sessions:
+                    sessions.pop(name)
+                    for legacy in ("session_id", "cwd", "model"):
+                        state.pop(legacy, None)
+                    state["sessions"] = sessions
+                    save_state(state)
+            if self._current == name:
+                self._current = "main"
+                self._persist_current()
+            return existed
+
     def busy(self, uid: int) -> bool:
         return self._locks[uid].locked()
 
     def cancel(self, uid: int) -> bool:
-        """Kill the in-flight run of the main session, if any.
+        """Kill the in-flight run of the current session, if any.
 
         Deliberately does NOT take the lock — the whole point is to interrupt
         the ask() currently holding it. Queued asks behind it still run.
         """
-        if self._main is None:
+        sess = self._sessions.get(self._current)
+        if sess is None:
             return False
-        return self._main.cancel_current()
+        return sess.cancel_current()
 
     async def reset(self, uid: int) -> None:
         async with self._locks[uid]:
-            if self._main is not None:
-                await self._main.reset()
+            sess = self._sessions.get(self._current)
+            if sess is not None:
+                await sess.reset()
 
     async def ask(
         self,
@@ -161,48 +262,45 @@ class ClaudeRunner:
             self._busy_since = time.time()
             try:
                 wanted = self._wanted_model()
-                if self._main is None:
-                    self._main = ClaudeSession(
-                        cwd=WORKSPACE_DIR,
-                        model=wanted,
-                        persist_state=True,
-                        append_system_prompt=_TGQ_SYSTEM_PROMPT,
-                    )
-                elif self._main.model != wanted:
+                sess = self._get_session(self._current)
+                if sess.model != wanted:
                     log.info(
-                        "model switched %s -> %s; resetting session",
-                        self._main.model, wanted,
+                        "model switched %s -> %s; resetting session %s",
+                        sess.model, wanted, self._current,
                     )
-                    await self._main.reset()
-                    self._main.set_model(wanted)
+                    await sess.reset()
+                    sess.set_model(wanted)
 
-                log.info("ask: %s", text[:200])
-                return await self._main.ask(
+                log.info("ask[%s]: %s", self._current, text[:200])
+                return await sess.ask(
                     text, on_tool_use=on_tool_use, on_text=on_text
                 )
             finally:
                 self._busy_since = None
 
     def status_info(self) -> dict:
-        s = self._main
+        s = self._sessions.get(self._current)
         return {
+            "session_name": self._current,
             "session_id": s.session_id if s else None,
             "busy_since": self._busy_since,
             "last_result": s.last_result if s else None,
             "total_cost_usd": s.total_cost_usd if s else 0.0,
         }
 
-    async def ask_isolated(self, prompt: str) -> str:
+    async def ask_isolated(self, prompt: str, model: str | None = None) -> str:
         """Run an isolated one-shot query in a fresh, non-persisted session.
 
         Used by /file and scheduled jobs so their context never pollutes the
-        main chat session: runs without --resume and never saves a session id.
+        chat sessions: runs without --resume and never saves a session id.
+        `model` overrides the globally selected model (scheduled-job routing).
         """
-        wanted = self._wanted_model()
+        wanted = model if model and model != "default" else self._wanted_model()
         sess = ClaudeSession(
             cwd=WORKSPACE_DIR,
             model=wanted,
             persist_state=False,
+            append_system_prompt=_PROACTIVE_PROMPT,
         )
         try:
             return await sess.ask(prompt)
@@ -278,6 +376,23 @@ def save_credentials_json(creds_json: str) -> None:
     CLAUDE_CREDS.write_text(creds_json)
     CLAUDE_CREDS.chmod(0o600)
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+
+
+def _load_chat_id() -> int | None:
+    try:
+        return int(json.loads(CHAT_FILE.read_text())["chat_id"])
+    except Exception:
+        return None
+
+
+def _save_chat_id(chat_id: int) -> None:
+    try:
+        if _load_chat_id() == chat_id:
+            return
+        CHAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CHAT_FILE.write_text(json.dumps({"chat_id": chat_id}))
+    except Exception as e:
+        log.warning("could not persist chat id: %s", e)
 
 
 def load_model() -> str:
@@ -612,9 +727,49 @@ async def claude_reply(update: Update, prompt: str) -> str | None:
     )
 
 
+async def check_notify(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Deliver Claude's proactive messages: any file dropped into
+    workspace/.notify/ is sent to the user's chat and removed. Runs every few
+    seconds via the JobQueue. Files that fail to send are renamed *.failed so
+    they don't loop."""
+    notify_dir = WORKSPACE_DIR / ".notify"
+    if not notify_dir.is_dir():
+        return
+    chat_id = _load_chat_id()
+    if chat_id is None:
+        return  # nobody has talked to the bot yet; leave files for later
+    try:
+        paths = sorted(
+            (p for p in notify_dir.iterdir() if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+        )
+    except OSError as e:
+        log.warning("notify scan failed: %s", e)
+        return
+    for path in paths:
+        if path.name.startswith(".") or path.suffix == ".failed":
+            continue
+        try:
+            text = path.read_text(errors="replace").strip()[:8000]
+        except Exception as e:
+            log.warning("notify read failed for %s: %s", path.name, e)
+            continue
+        try:
+            if text:
+                await send_md(ctx.bot, chat_id, "🔔 " + text)
+            path.unlink()
+        except Exception as e:
+            log.warning("notify delivery failed for %s: %s", path.name, e)
+            try:
+                path.rename(path.with_name(path.name + ".failed"))
+            except Exception:
+                pass
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
+    _save_chat_id(update.effective_chat.id)
     await update.message.reply_text(
         "Bot ready. Send a message to talk to Claude Code.\nUse /help for commands."
     )
@@ -624,7 +779,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
     await update.message.reply_text(
-        "/new - new conversation\n"
+        "/new - new conversation (current session)\n"
+        "/session [name|del name] - list/switch/create/delete named sessions\n"
         "/cancel - kill the current Claude run\n"
         "/compact - compact context\n"
         "/status - session, running state, costs\n"
@@ -637,7 +793,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/export - download the session transcript\n"
         "/model [name] - show or set Claude model\n"
         "React to my messages: 👍 go ahead, 👎 reconsider, ❤/🔥/💯 save to workspace/saved/\n"
-        '/schedule add "<cron>" <prompt> - recurring prompt\n'
+        '/schedule add "<cron>" [model=<m>] <prompt> - recurring prompt\n'
         "/schedule list - list jobs\n"
         "/schedule remove <id> - remove job\n"
         "/help - this list"
@@ -648,7 +804,70 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
     await claude.reset(update.effective_user.id)
-    await update.message.reply_text("New session started.")
+    await update.message.reply_text(
+        f"New session started ({claude.current_name})."
+    )
+
+
+async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    uid = update.effective_user.id
+    if ctx.args:
+        sub = ctx.args[0].strip().lower()
+        if sub == "del":
+            if len(ctx.args) < 2:
+                await update.message.reply_text("Usage: /session del <name>")
+                return
+            name = ctx.args[1].strip().lower()
+            if await claude.delete(uid, name):
+                await update.message.reply_text(
+                    f"Session '{name}' deleted. Current: {claude.current_name}"
+                )
+            else:
+                await update.message.reply_text(f"No session named '{name}'.")
+            return
+        name = sub
+        if not _SESSION_NAME_RE.match(name):
+            await update.message.reply_text(
+                "Invalid name: use a-z, 0-9, - and _, max 32 chars."
+            )
+            return
+        await claude.switch(uid, name)
+        await update.message.reply_text(f"Session: {name}")
+        return
+    names = claude.session_names()
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'• ' if n == claude.current_name else ''}{n}",
+            callback_data=f"session:{n}",
+        )]
+        for n in names
+    ]
+    await update.message.reply_text(
+        f"Current session: {claude.current_name}\n"
+        "Tap to switch, or /session <name> to create, /session del <name> to delete.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def on_session_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    if update.effective_user is None or update.effective_user.id != ALLOWED_USER:
+        await query.answer("Not authorized.")
+        return
+    name = query.data.split(":", 1)[1]
+    if not _SESSION_NAME_RE.match(name):
+        await query.answer("Invalid session.")
+        return
+    await claude.switch(update.effective_user.id, name)
+    await query.answer(f"Switched to {name}")
+    try:
+        await query.edit_message_text(f"Session: {name}")
+    except Exception:
+        pass
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -729,7 +948,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
         f"Auth: {'✅' if is_authed() else '❌ — use /login'}",
         f"Model: {load_model()}",
-        f"Session: {info['session_id'] or 'none'}",
+        f"Session: {info['session_name']} ({info['session_id'] or 'no id yet'})",
     ]
     if info["busy_since"]:
         lines.append(f"Running: yes, for {_fmt_secs(time.time() - info['busy_since'])}")
@@ -783,25 +1002,30 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
     if ctx.args:
+        # Free-text escape hatch for models not on the button list; the CLI
+        # validates the actual name on the next turn.
         name = ctx.args[0].strip()
-        if name not in MODEL_CHOICES:
+        if not _MODEL_NAME_RE.match(name):
             await update.message.reply_text(
-                f"Unknown model. Choices: {', '.join(MODEL_CHOICES)}"
+                "Invalid model name. Use /model and pick from the list, or "
+                "pass a plain model id (letters, digits, . - _ [ ])."
             )
             return
         save_model(name)
-        await update.message.reply_text(f"Model set to {name}.")
+        await update.message.reply_text(
+            f"Model set to {name}. (Switching model resets the session.)"
+        )
         return
     current = load_model()
     keyboard = [
         [InlineKeyboardButton(
-            f"{'> ' if c == current else ''}{c}",
-            callback_data=f"model:{c}",
+            f"{'• ' if value == current else ''}{label}",
+            callback_data=f"model:{value}",
         )]
-        for c in MODEL_CHOICES
+        for label, value in MODEL_CHOICES
     ]
     await update.message.reply_text(
-        f"Current: {current}\nChoose a model:",
+        f"Current: {current}\nChoose a model (switching resets the session):",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -860,7 +1084,7 @@ async def on_model_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await query.answer("Not authorized.")
         return
     name = query.data.split(":", 1)[1]
-    if name not in MODEL_CHOICES:
+    if name not in MODEL_VALUES:
         await query.answer("Invalid model.")
         return
     save_model(name)
@@ -966,7 +1190,12 @@ async def cmd_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not jobs:
             await update.message.reply_text("No scheduled jobs.")
             return
-        lines = [f"{j['id']}: {j['cron']!r} -> {j['prompt'][:80]}" for j in jobs]
+        lines = [
+            f"{j['id']}: {j['cron']!r}"
+            + (f" [{j['model']}]" if j.get("model") else "")
+            + f" -> {j['prompt'][:80]}"
+            for j in jobs
+        ]
         await update.message.reply_text("\n".join(lines))
         return
 
@@ -998,6 +1227,14 @@ async def cmd_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             cron_expr = " ".join(parts[:5])
             prompt = parts[5]
+        # Optional per-job model routing: /schedule add "<cron>" model=haiku <prompt>
+        job_model = None
+        if prompt.startswith("model="):
+            head, _, rest = prompt.partition(" ")
+            candidate = head[len("model="):]
+            if candidate and _MODEL_NAME_RE.match(candidate) and rest.strip():
+                job_model = candidate
+                prompt = rest.strip()
         if not prompt:
             await update.message.reply_text("Empty prompt.")
             return
@@ -1007,11 +1244,13 @@ async def cmd_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 prompt=prompt,
                 chat_id=update.effective_chat.id,
                 uid=update.effective_user.id,
+                model=job_model,
             )
         except ValueError as e:
             await update.message.reply_text(f"Invalid cron: {e}")
             return
-        await update.message.reply_text(f"Scheduled job {job_id}.")
+        suffix = f" (model {job_model})" if job_model else ""
+        await update.message.reply_text(f"Scheduled job {job_id}{suffix}.")
         return
 
     await update.message.reply_text(f"Unknown subcommand: {sub}")
@@ -1026,6 +1265,7 @@ def _safe_filename(name: str) -> str:
 async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
+    _save_chat_id(update.effective_chat.id)
     msg = update.message
 
     obj = None
@@ -1130,6 +1370,7 @@ async def _tts(text: str) -> bytes:
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
+    _save_chat_id(update.effective_chat.id)
     voice = update.message.voice or update.message.audio
     if not voice:
         return
@@ -1187,6 +1428,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
+    _save_chat_id(update.effective_chat.id)
     text = update.message.text.strip()
 
     if text.startswith("{") and ("claudeAiOauth" in text or "accessToken" in text):
@@ -1417,6 +1659,7 @@ async def on_reaction(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def post_init(app: Application) -> None:
     commands = [
         BotCommand("new", "new conversation"),
+        BotCommand("session", "list/switch named sessions"),
         BotCommand("cancel", "kill the current Claude run"),
         BotCommand("compact", "compact context"),
         BotCommand("status", "session, running state, costs"),
@@ -1452,11 +1695,13 @@ def main() -> None:
         .build()
     )
 
-    async def run_scheduled(prompt: str, chat_id: int, uid: int) -> None:
+    async def run_scheduled(
+        prompt: str, chat_id: int, uid: int, model: str | None = None
+    ) -> None:
         # Isolated one-shot session: recurring jobs must not pollute (or
         # depend on) the interactive chat session's context.
         try:
-            resp = await claude.ask_isolated(prompt)
+            resp = await claude.ask_isolated(prompt, model=model)
         except ClaudeSessionError as e:
             await app.bot.send_message(chat_id=chat_id, text=session_error_reply(e))
             return
@@ -1468,9 +1713,14 @@ def main() -> None:
     scheduler = Scheduler(JOBS_FILE, app.job_queue, run_scheduled)
     scheduler.load()
 
+    # Claude's proactive-message inbox (see check_notify / _PROACTIVE_PROMPT).
+    app.job_queue.run_repeating(check_notify, interval=5, first=10, name="notify-inbox")
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("session", cmd_session))
+    app.add_handler(CallbackQueryHandler(on_session_callback, pattern=r"^session:"))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("compact", cmd_compact))
     app.add_handler(CommandHandler("auth", cmd_auth))
