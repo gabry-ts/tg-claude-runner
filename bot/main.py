@@ -414,8 +414,8 @@ _SENT_CACHE: dict[int, str] = {}
 
 
 def _remember_sent(message_id: int, text: str) -> None:
-    if len(_SENT_CACHE) > 300:
-        for k in list(_SENT_CACHE)[:100]:
+    if len(_SENT_CACHE) >= 30:
+        for k in list(_SENT_CACHE)[:10]:
             _SENT_CACHE.pop(k, None)
     _SENT_CACHE[message_id] = text
 
