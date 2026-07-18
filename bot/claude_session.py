@@ -47,6 +47,36 @@ class ClaudeSessionError(RuntimeError):
     pass
 
 
+_LINE_BUF_HARD_LIMIT = 256 * 1024 * 1024
+
+
+async def _iter_lines(stream: asyncio.StreamReader):
+    """Yield newline-delimited chunks without asyncio's 64 KiB readline cap.
+
+    stream-json events that embed file contents — e.g. an image read for
+    vision after a photo upload — easily exceed StreamReader's default
+    limit, making readline() raise 'Separator is found, but chunk is longer
+    than limit' and killing the turn.
+    """
+    buf = bytearray()
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            if buf:
+                yield bytes(buf)
+            return
+        buf += chunk
+        if len(buf) > _LINE_BUF_HARD_LIMIT:
+            raise ClaudeSessionError("stream line exceeded 256 MiB")
+        while True:
+            idx = buf.find(b"\n")
+            if idx < 0:
+                break
+            line = bytes(buf[:idx])
+            del buf[: idx + 1]
+            yield line
+
+
 def _kill_proc_tree(proc: asyncio.subprocess.Process) -> None:
     """Kill the process group (claude + any children it spawned).
 
@@ -184,10 +214,7 @@ class ClaudeSession:
         async def _read_stream() -> None:
             nonlocal final_text, new_session_id, is_error
             assert proc.stdout is not None
-            while True:
-                raw = await proc.stdout.readline()
-                if not raw:
-                    break
+            async for raw in _iter_lines(proc.stdout):
                 entry = transcript.parse_line(raw.decode("utf-8", "replace"))
                 if entry is None:
                     continue
