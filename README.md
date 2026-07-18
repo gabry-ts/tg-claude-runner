@@ -53,7 +53,7 @@ docker compose logs -f
 
 In Telegram, open the bot and:
 
-1. `/login` → follow the prompt and paste your Claude Code credentials JSON
+1. `/login` → open the link, sign into claude.ai (email + code), paste back the code shown
 2. Send any message → it goes to Claude
 
 ## How the volumes are laid out
@@ -95,7 +95,11 @@ The bot's own Python code is in the container at `/app/` and is **not** visible 
 
 ## Login flow
 
-The bot doesn't run an OAuth flow — it expects you to extract credentials from a machine where you're already authenticated.
+**Browser login (default):** `/login` sends you a claude.ai link. Open it, sign in as usual (email + one-time code), approve the authorization, and paste the short code shown back into the chat. The bot exchanges it for tokens (PKCE — it never sees your email/password/code) and writes `/home/node/.claude/.credentials.json` itself. Because this is a fresh OAuth grant, the bot's tokens are independent from your other machines — no refresh-token rotation conflicts. The pasted code message is deleted right away.
+
+This uses the same OAuth endpoints the Claude Code CLI itself talks to (not a separately documented public API), so if it ever breaks there's a fallback:
+
+**Fallback — paste credentials from an authenticated machine:**
 
 **macOS:**
 ```bash
@@ -107,7 +111,7 @@ security find-generic-password -s "Claude Code-credentials" -w
 cat ~/.claude/.credentials.json
 ```
 
-Paste the JSON to the bot. It's written to `/home/node/.claude/.credentials.json`, which lives in the bind-mounted `~/claude_bot/` so it persists across everything. The bot deletes your pasted message right after saving, so the OAuth token doesn't linger in the chat history.
+Paste the JSON to the bot. It's written to the same place, which lives in the bind-mounted `~/claude_bot/` so it persists across everything. The bot deletes your pasted message right after saving, so the OAuth token doesn't linger in the chat history.
 
 The credentials contain a short-lived access token plus a refresh token; the Claude CLI renews the access token automatically, so a single `/login` normally lasts until the refresh token itself is invalidated (e.g. rotated by another machine using the same account). When that happens the bot tells you explicitly to `/login` again.
 
@@ -174,7 +178,7 @@ sudo apt-get install -y postgresql-client redis-tools
 | `/start` | greeting |
 | `/help` | list commands |
 | `/auth` | check Claude auth status |
-| `/login` | paste Claude credentials |
+| `/login` | sign in via browser link (fallback: paste credentials JSON) |
 | `/new` | reset the current Claude session |
 | `/session [name]` | list named sessions (buttons) / switch or create one |
 | `/session del <name>` | delete a named session |

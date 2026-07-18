@@ -46,6 +46,7 @@ from .claude_session import (
     sessions_in_state,
 )
 from .session_state import load_state, save_state
+from . import oauth
 from . import transcript
 from .transcript import ToolUse
 
@@ -982,7 +983,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/quick [add|rm|hide] - persistent keyboard with your prompts\n"
         "/logs [n] - last n bot log lines\n"
         "/auth - check Claude auth status\n"
-        "/login - paste Claude credentials\n"
+        "/login - sign in via browser link (or paste credentials JSON)\n"
         "/file <query> - retrieve files matching a query (Claude searches)\n"
         "/get <path> - send a workspace file by path (no Claude)\n"
         "/img [n] <prompt> - generate image(s), n=2-4 as album (OpenAI)\n"
@@ -1328,17 +1329,29 @@ async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Claude is not authenticated. Use /login.")
 
 
+# One pending browser login at a time (single-user bot).
+_PENDING_LOGIN: dict = {"login": None}
+
+
 async def cmd_login(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
+    login = oauth.new_login()
+    _PENDING_LOGIN["login"] = login
     await update.message.reply_text(
-        "On a machine where Claude Code is authenticated, run:\n\n"
-        "macOS:\n"
-        '`security find-generic-password -s "Claude Code-credentials" -w`\n\n'
-        "Linux:\n"
-        "`cat ~/.claude/.credentials.json`\n\n"
-        "Then paste the resulting JSON here.",
+        "🔐 Sign in with your browser:\n"
+        "1. Open the link below\n"
+        "2. Log into claude.ai (email + code)\n"
+        "3. Approve the authorization\n"
+        "4. Copy the code shown and paste it here\n\n"
+        "The link expires in 15 minutes.\n\n"
+        "Fallback: paste the credentials JSON from an authenticated machine "
+        "(macOS: `security find-generic-password -s \"Claude Code-credentials\" -w`, "
+        "Linux: `cat ~/.claude/.credentials.json`).",
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔐 Accedi a Claude", url=login["url"])]]
+        ),
     )
 
 
@@ -1837,6 +1850,31 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     _save_chat_id(update.effective_chat.id)
     text = update.message.text.strip()
 
+    # Pending browser login: the pasted authorization code gets exchanged
+    # for tokens (see bot/oauth.py). The bot never sees email/password.
+    pending = _PENDING_LOGIN.get("login")
+    if pending is not None and oauth.looks_like_code(text):
+        if oauth.is_expired(pending):
+            _PENDING_LOGIN["login"] = None
+            await update.message.reply_text("Login expired — run /login again.")
+            return
+        try:
+            creds = await oauth.exchange_code(text, pending)
+        except Exception as e:
+            log.warning("oauth exchange failed: %s", e)
+            await update.message.reply_text(
+                f"Login failed: {e}\nOpen the /login link and try a fresh code."
+            )
+            return
+        _PENDING_LOGIN["login"] = None
+        save_credentials_json(json.dumps(creds))
+        try:
+            await update.message.delete()
+        except Exception as e:
+            log.debug("could not delete code message: %s", e)
+        await update.effective_chat.send_message("✅ Logged in. Claude is ready.")
+        return
+
     if text.startswith("{") and ("claudeAiOauth" in text or "accessToken" in text):
         try:
             save_credentials_json(text)
@@ -2165,7 +2203,7 @@ async def post_init(app: Application) -> None:
         BotCommand("img", "generate an image (OpenAI)"),
         BotCommand("export", "download the session transcript"),
         BotCommand("auth", "check auth status"),
-        BotCommand("login", "paste credentials"),
+        BotCommand("login", "sign in via browser link"),
         BotCommand("file", "retrieve files matching a query"),
         BotCommand("get", "send a workspace file by path"),
         BotCommand("model", "show or set Claude model"),
