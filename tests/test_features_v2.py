@@ -417,3 +417,55 @@ class TestChatIdPersistence:
 def test_system_appendix_mentions_notify_and_tgq():
     assert "TGQUESTION" in m._SYSTEM_APPENDIX
     assert ".notify" in m._SYSTEM_APPENDIX
+
+
+# ---------------------------------------------------------------------------
+# copy buttons for code blocks
+# ---------------------------------------------------------------------------
+
+class TestCopySnippets:
+    def test_extracts_fenced_blocks(self):
+        text = "Esegui:\n```bash\ndocker compose up -d\n```\npoi:\n```\ngit pull\n```"
+        assert m._copy_snippets(text) == ["docker compose up -d", "git pull"]
+
+    def test_skips_blocks_over_256_chars(self):
+        long_block = "x" * 300
+        text = f"```\n{long_block}\n```\n```\nok\n```"
+        assert m._copy_snippets(text) == ["ok"]
+
+    def test_dedupes_and_caps_at_four(self):
+        blocks = "\n".join(f"```\ncmd{i}\n```" for i in [1, 1, 2, 3, 4, 5])
+        snippets = m._copy_snippets(blocks)
+        assert snippets == ["cmd1", "cmd2", "cmd3", "cmd4"]
+
+    def test_no_blocks_no_snippets(self):
+        assert m._copy_snippets("solo testo, `inline` non conta") == []
+
+    def test_keyboard_labels_and_payload(self):
+        kb = m._copy_keyboard("```bash\ndocker compose up -d --build && echo fatto ciao\n```")
+        [row] = kb.inline_keyboard
+        btn = row[0]
+        assert btn.text.startswith("📋 docker compose up -d --bui")
+        assert btn.text.endswith("…")
+        assert btn.copy_text.text == "docker compose up -d --build && echo fatto ciao"
+
+    def test_keyboard_none_without_blocks(self):
+        assert m._copy_keyboard("niente codice qui") is None
+
+
+class TestSendMdCopyButtons:
+    def test_markup_only_on_last_chunk(self):
+        long_text = ("riga di testo normale\n" * 200) + "```\ngit status\n```"
+        bot = FakeBot()
+        asyncio.run(m.send_md(bot, 1, long_text))
+        assert len(bot.sent) > 1
+        markups = [kw.get("reply_markup") for _, _, kw in bot.sent]
+        assert all(mk is None for mk in markups[:-1])
+        last = markups[-1]
+        assert last is not None
+        assert last.inline_keyboard[0][0].copy_text.text == "git status"
+
+    def test_no_markup_without_code(self):
+        bot = FakeBot()
+        asyncio.run(m.send_md(bot, 1, "ciao"))
+        assert bot.sent[0][2].get("reply_markup") is None

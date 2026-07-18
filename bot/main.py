@@ -18,6 +18,7 @@ from collections import defaultdict, deque
 from telegram import (
     Update,
     BotCommand,
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReactionTypeEmoji,
@@ -535,6 +536,39 @@ def _remember_sent(message_id: int, text: str) -> None:
     _SENT_CACHE[message_id] = text
 
 
+_CODE_BLOCK_RE = re.compile(r"```\w*\n?(.*?)```", re.DOTALL)
+
+
+def _copy_snippets(text: str, limit: int = 4) -> list[str]:
+    """Fenced code blocks worth a one-tap copy button.
+
+    Telegram's CopyTextButton caps the payload at 256 chars, so longer blocks
+    are skipped (they'd be truncated silently otherwise)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _CODE_BLOCK_RE.finditer(text):
+        snippet = match.group(1).strip()
+        if snippet and len(snippet) <= 256 and snippet not in seen:
+            seen.add(snippet)
+            out.append(snippet)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _copy_keyboard(text: str) -> InlineKeyboardMarkup | None:
+    rows = []
+    for snippet in _copy_snippets(text):
+        first_line = snippet.splitlines()[0]
+        label = f"📋 {first_line[:28]}"
+        if len(first_line) > 28 or "\n" in snippet:
+            label += "…"
+        rows.append(
+            [InlineKeyboardButton(label, copy_text=CopyTextButton(snippet))]
+        )
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 async def send_md(bot, chat_id: int, text: str) -> None:
     """Send text as MarkdownV2, falling back to plain per chunk.
 
@@ -543,10 +577,16 @@ async def send_md(bot, chat_id: int, text: str) -> None:
     its own — earlier chunks are never re-sent. The split margin (3000 vs
     Telegram's 4096) leaves room for escape backslashes added by conversion;
     a chunk that still overflows after conversion is sent plain.
+
+    Short fenced code blocks get one-tap copy buttons attached to the last
+    chunk (native CopyTextButton — no callback round-trip).
     """
     if not text:
         text = "(no response)"
-    for chunk in split_for_telegram(text, max_len=3000):
+    chunks = split_for_telegram(text, max_len=3000)
+    keyboard = _copy_keyboard(text)
+    for i, chunk in enumerate(chunks):
+        markup = keyboard if i == len(chunks) - 1 else None
         converted = to_telegram_markdown(chunk)
         if len(converted) <= 4000:
             try:
@@ -555,12 +595,13 @@ async def send_md(bot, chat_id: int, text: str) -> None:
                     text=converted,
                     parse_mode="MarkdownV2",
                     disable_web_page_preview=True,
+                    reply_markup=markup,
                 )
                 _remember_sent(msg.message_id, chunk)
                 continue
             except Exception as e:
                 log.warning("MarkdownV2 send failed (%s); falling back to plain", e)
-        msg = await bot.send_message(chat_id=chat_id, text=chunk)
+        msg = await bot.send_message(chat_id=chat_id, text=chunk, reply_markup=markup)
         _remember_sent(msg.message_id, chunk)
 
 

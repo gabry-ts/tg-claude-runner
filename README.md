@@ -11,6 +11,7 @@ Telegram bot that wraps the [Claude Code](https://docs.claude.com/en/docs/claude
 - **Live streaming**: the status message is edited in place with the partial assistant text and the latest tool action as Claude works, so you watch the reply grow instead of staring at "thinking…".
 - **Inline questions**: when Claude needs you to pick between options, the choices arrive as Telegram inline buttons — tap one and the answer goes back to Claude as your next turn. (Under the hood a system prompt teaches Claude to end such replies with a `TGQUESTION: {...}` JSON marker; the bot strips it and renders 2–6 option buttons. Buttons live in an in-memory cache, so they expire on bot restart.)
 - **File buttons**: workspace files mentioned in a reply get "📎" download buttons, no manual `/get` needed.
+- **Copy buttons**: short fenced code blocks (≤256 chars, Telegram's cap) in a reply get one-tap "📋" copy buttons under the message — native clipboard copy, no long-press selection.
 - **`/status`**: auth state, selected model, active session, current run duration, last-turn cost/duration/tokens, cumulative session cost, bot uptime.
 - **`/model`**: switch the Claude model via inline buttons — aliases (`opus`, `sonnet`, `haiku`, `opusplan`) that track the latest version plus pinned IDs (Sonnet 5, Opus 4.8, Haiku 4.5); `/model <name>` accepts any model id as a free-text escape hatch. Persisted to `data/model.json`; switching models resets the session.
 - **Transient-error retry**: overloaded/5xx/network errors are retried automatically with backoff before you ever see them.
