@@ -5,16 +5,18 @@ Telegram bot that wraps the [Claude Code](https://docs.claude.com/en/docs/claude
 ## What you get
 
 - **Telegram bridge to Claude Code**: free-text messages are sent to Claude Code in headless print mode (`claude -p --output-format stream-json`). Each turn streams back the assistant text plus live tool-use events; the conversation is continued with `--resume <session_id>`, which also lets sessions survive bot restarts.
-- **Message queue**: messages sent while Claude is busy get an instant "📥 Queued" reply and run in order (best-effort FIFO) when the current turn finishes. `/cancel` kills the in-flight run; `/get`, `/auth`, `/login`, `/model` keep working while Claude is busy.
+- **Message queue**: messages sent while Claude is busy get an instant "📥 Queued" reply and run in order (best-effort FIFO) when the current turn finishes. `/cancel` kills the in-flight run (queued messages still run — repeat `/cancel` to kill the next one); all other commands (`/get`, `/status`, `/logs`, `/auth`, `/login`, `/model`, …) keep working while Claude is busy.
 - **Live streaming**: the status message is edited in place with the partial assistant text and the latest tool action as Claude works, so you watch the reply grow instead of staring at "thinking…".
-- **Inline questions**: when Claude needs you to pick between options, the choices arrive as Telegram inline buttons — tap one and the answer goes back to Claude as your next turn.
+- **Inline questions**: when Claude needs you to pick between options, the choices arrive as Telegram inline buttons — tap one and the answer goes back to Claude as your next turn. (Under the hood a system prompt teaches Claude to end such replies with a `TGQUESTION: {...}` JSON marker; the bot strips it and renders 2–6 option buttons. Buttons live in an in-memory cache, so they expire on bot restart.)
 - **File buttons**: workspace files mentioned in a reply get "📎" download buttons, no manual `/get` needed.
-- **`/status`**: auth state, active session, current run duration, last-turn cost/duration/tokens, cumulative session cost.
+- **`/status`**: auth state, selected model, active session, current run duration, last-turn cost/duration/tokens, cumulative session cost, bot uptime.
+- **`/model`**: show or switch the Claude model (`default`, `sonnet`, `opus`, `haiku`) via inline buttons; persisted to `data/model.json`. Switching models resets the session.
 - **Transient-error retry**: overloaded/5xx/network errors are retried automatically with backoff before you ever see them.
 - **Emoji reactions**: the bot reacts 👀 to your message when it starts working on it, 👍 when done, 💔 on failure — ambient feedback without extra chat noise.
-- **Reactions as commands**: react to a bot message with 👍 to tell Claude "go ahead", 👎 for "reconsider" (the reacted text is sent back as context), or ❤/🔥/💯 to save that message to `workspace/saved/` as a note.
+- **Reactions as commands**: react to a bot message with 👍 to tell Claude "go ahead", 👎 for "reconsider" (the reacted text is sent back as context), or ❤/🔥/💯 to save that message to `workspace/saved/` as a note. The bot keeps the text of only the last ~30 sent messages in memory — reacting to anything older (or sent before a restart) gets a "too old" response.
 - **Image generation**: `/img <prompt>` generates an image via OpenAI (`gpt-image-1` by default, `IMAGE_MODEL` to change) and sends it as a photo.
 - **`/export`**: downloads the current session's transcript as a markdown file (user/assistant turns plus tool-use markers).
+- **`/logs [n]`**: last n bot log lines (default 50, max 400) from an in-memory ring buffer; long output is sent as a `bot.log` file.
 - **MarkdownV2 rendering**: Claude's markdown output is auto-escaped to Telegram-safe MarkdownV2 (bold, italic, code, links, code blocks).
 - **Built-in scheduler**: `/schedule add "<cron>" <prompt>` registers a recurring job, persisted to `data/jobs.json`, restored on restart.
 - **Pre-installed CLIs**: `gh`, `git`, `curl`, `wget`, `jq`, `rsync`, `ssh`, `vim`, `nano`, `tree`, `zip/unzip`, plus `node`, `npm`, `python3`, `pip`.
@@ -65,6 +67,7 @@ HOST                                 CONTAINER
 
 <repo>/data/              <-- bind --> /app/data/       (bot internal state)
   jobs.json                            jobs.json
+  model.json                           model.json
 ```
 
 `CLAUDE_BOT_HOME` in `.env` overrides the default host path (`~/claude_bot`).
@@ -161,9 +164,10 @@ sudo apt-get install -y postgresql-client redis-tools
 | `/login` | paste Claude credentials |
 | `/new` | reset Claude session |
 | `/cancel` | kill the current Claude run (queued messages still run) |
-| `/status` | auth, session, running state, costs |
+| `/status` | auth, model, session, running state, costs |
 | `/logs [n]` | last n bot log lines (default 50, max 400) |
-| `/img <prompt>` | generate an image via OpenAI |
+| `/img <prompt>` | generate an image via OpenAI (needs `OPENAI_API_KEY`) |
+| `/model [name]` | show or set the Claude model (`default`, `sonnet`, `opus`, `haiku`) |
 | `/export` | download the session transcript as markdown |
 | `/compact` | compact context: summarize the session, then restart it seeded with the summary |
 | `/file <query>` | retrieve file(s) matching a description (Claude searches workspace, isolated session) |
@@ -204,6 +208,7 @@ If `OPENAI_API_KEY` is set in `.env`, voice and audio messages are transcribed v
 | `IMAGE_MODEL` | `gpt-image-1` | OpenAI image model for `/img` (e.g. `dall-e-3`) |
 | `TGCR_RESPONSE_TIMEOUT` | `0` | Max seconds to wait for a Claude reply per turn. `0` = no timeout: a turn runs until Claude finishes or `/cancel` kills it |
 | `TGCR_CLAUDE_BIN` | `claude` | Path to the Claude Code binary |
+| `TGCR_STATE_DIR` | `~/.tg-claude-runner` | Where `state.json` (resumable session id) is kept |
 
 ## Layout
 
@@ -216,10 +221,14 @@ If `OPENAI_API_KEY` is set in `.env`, voice and audio messages are transcribed v
 │   ├── session_state.py   # persistence of session_id/cwd across restarts
 │   ├── markdown_v2.py     # markdown -> Telegram MarkdownV2 conversion
 │   └── scheduler.py       # JobQueue persistence (data/jobs.json)
-├── data/                  # bot internal state (jobs.json) — bind-mounted
+├── tests/                 # pytest suite (conftest.py sets fake env before bot.main import)
+├── .github/workflows/
+│   ├── docker.yml         # image build
+│   └── tests.yml          # runs pytest on push / pull_request
+├── data/                  # bot internal state (jobs.json, model.json) — bind-mounted
 ├── docker-compose.yml
 ├── Dockerfile
-├── entrypoint.sh          # pre-trusts /workspace, clears onboarding prompts
+├── entrypoint.sh          # pre-trusts /workspace, clears onboarding prompts, runs workspace/init.sh
 ├── requirements.txt
 └── .env.example
 ```
@@ -247,6 +256,17 @@ bot/main.py handler  ──▶  ClaudeRunner.ask(uid, text)
 ```
 
 Each `/new` drops the saved session id so the next prompt starts a fresh Claude session. `/file` and scheduled jobs run without `--resume` (non-persisted one-shots) so they never pollute the chat session.
+
+## Development & tests
+
+The test suite lives in `tests/` and needs no Telegram token, Claude binary, or network — `tests/conftest.py` injects fake env vars and temp dirs before `bot.main` is imported.
+
+```bash
+pip install -r requirements.txt pytest
+python -m pytest tests -q
+```
+
+CI (`.github/workflows/tests.yml`) runs the same command on every push and pull request.
 
 ## Security notes
 
