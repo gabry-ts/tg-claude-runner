@@ -355,7 +355,7 @@ def test_run_claude_turn_tgquestion(monkeypatch):
     assert btn0.text == "A"
     assert btn0.callback_data.startswith("tgq:")
     token = btn0.callback_data.split(":")[1]
-    assert main._CB_CACHE[token] == ("Pick one", ["A", "B"], 10, 1)
+    assert main._CB_CACHE[token] == ("Pick one", ["A", "B"], 10, 1, None)
     assert keyboard[1][0].callback_data == f"tgq:{token}:1"
 
 
@@ -403,11 +403,11 @@ def test_tgq_callback_valid_choice(monkeypatch):
     bot = FakeBot()
     turns = []
 
-    async def fake_turn(b, chat_id, uid, prompt, react_to=None):
+    async def fake_turn(b, chat_id, uid, prompt, react_to=None, **kw):
         turns.append((chat_id, uid, prompt))
 
     monkeypatch.setattr(main, "run_claude_turn", fake_turn)
-    token = main._cb_store(("Pick one", ["A", "B"], 10, 1))
+    token = main._cb_store(("Pick one", ["A", "B"], 10, 1, None))
     query = FakeCallbackQuery(f"tgq:{token}:1")
     upd = SimpleNamespace(
         callback_query=query, effective_user=SimpleNamespace(id=1)
@@ -443,7 +443,7 @@ def test_tgq_callback_bad_index(monkeypatch):
         called.append(a)
 
     monkeypatch.setattr(main, "run_claude_turn", fake_turn)
-    token = main._cb_store(("Q", ["A", "B"], 10, 1))
+    token = main._cb_store(("Q", ["A", "B"], 10, 1, None))
     query = FakeCallbackQuery(f"tgq:{token}:5")
     upd = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=1))
     asyncio.run(main.on_tgq_callback(upd, make_ctx(bot)))
@@ -465,7 +465,7 @@ def test_tgq_callback_foreign_user(monkeypatch):
         called.append(a)
 
     monkeypatch.setattr(main, "run_claude_turn", fake_turn)
-    token = main._cb_store(("Q", ["A", "B"], 10, 1))
+    token = main._cb_store(("Q", ["A", "B"], 10, 1, None))
     query = FakeCallbackQuery(f"tgq:{token}:0")
     upd = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=999))
     asyncio.run(main.on_tgq_callback(upd, make_ctx(FakeBot())))
@@ -534,7 +534,7 @@ def test_reaction_thumbs_up_approves(monkeypatch):
     bot = FakeBot()
     turns = []
 
-    async def fake_turn(b, chat_id, uid, prompt, react_to=None):
+    async def fake_turn(b, chat_id, uid, prompt, react_to=None, **kw):
         turns.append((chat_id, uid, prompt))
 
     monkeypatch.setattr(main, "run_claude_turn", fake_turn)
@@ -963,7 +963,9 @@ def test_cmd_img_no_args_usage(monkeypatch):
     monkeypatch.setattr(main, "_openai_client", SimpleNamespace())
     upd = make_update(bot, text="/img")
     asyncio.run(main.cmd_img(upd, make_ctx(bot)))
-    assert upd.message.replies == ["Usage: /img <description of the image>"]
+    assert upd.message.replies == [
+        "Usage: /img [n] <description>  (n = 2-4 variants, sent as an album)"
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -6,10 +6,17 @@ Telegram bot that wraps the [Claude Code](https://docs.claude.com/en/docs/claude
 
 - **Telegram bridge to Claude Code**: free-text messages are sent to Claude Code in headless print mode (`claude -p --output-format stream-json`). Each turn streams back the assistant text plus live tool-use events; the conversation is continued with `--resume <session_id>`, which also lets sessions survive bot restarts.
 - **Named sessions**: `/session work` switches to (or creates) a separate conversation; `/session` lists them with one-tap switch buttons, `/session del <name>` deletes one. Each named session keeps its own `--resume` id, so contexts never bleed into each other; `/new` resets only the current one.
-- **Proactive messages from Claude**: any file dropped into `workspace/.notify/` is delivered to your chat within seconds and deleted. Claude is told about this in its system prompt, so it can set up background scripts or cron jobs that ping you on their own ("the deploy finished", "disk almost full").
+- **Forum topics = sessions**: add the bot to a group with Topics enabled and each topic automatically becomes its own named session — switching conversation is just switching tab, replies stay inside their topic.
+- **Proactive messages from Claude**: any file dropped into `workspace/.notify/` is delivered to your chat within seconds and deleted. Claude is told about this in its system prompt, so it can set up background scripts or cron jobs that ping you on their own ("the deploy finished", "disk almost full"). A JSON payload with `question`/`options` becomes an **actionable notification**: you answer with buttons (or a poll) and the answer reaches Claude as a new turn.
+- **Reply & quote targeting**: reply (or quote-reply a precise slice) to any earlier message and Claude receives that exact text as explicit context — no copy-pasting to resume an old thread of discussion.
+- **Edited message = re-run**: fix a typo in an already-sent prompt and the bot offers a one-tap "🔁 Re-run" with the corrected text.
+- **Quick keyboard**: `/quick add <prompt>` builds a persistent reply keyboard with your recurring prompts (12 max); `/quick rm <n>` / `/quick hide` manage it.
+- **Pinned live status**: `/status pin` pins a status card that self-updates every 30s (session, model, running state, costs); `/status unpin` removes it.
+- **Long-run celebration**: replies to runs longer than 5 minutes arrive with a 🎉 message effect and an enlarged 👍 reaction.
+- **Expandable quotes**: markdown blockquotes in replies render as native Telegram quotes, collapsed when longer than 3 lines — long log dumps stop flooding the chat.
 - **Message queue**: messages sent while Claude is busy get an instant "📥 Queued" reply and run in order (best-effort FIFO) when the current turn finishes. `/cancel` kills the in-flight run (queued messages still run — repeat `/cancel` to kill the next one); all other commands (`/get`, `/status`, `/logs`, `/auth`, `/login`, `/model`, …) keep working while Claude is busy.
 - **Live streaming**: the status message is edited in place with the partial assistant text and the latest tool action as Claude works, so you watch the reply grow instead of staring at "thinking…".
-- **Inline questions**: when Claude needs you to pick between options, the choices arrive as Telegram inline buttons — tap one and the answer goes back to Claude as your next turn. (Under the hood a system prompt teaches Claude to end such replies with a `TGQUESTION: {...}` JSON marker; the bot strips it and renders 2–6 option buttons. Buttons live in an in-memory cache, so they expire on bot restart.)
+- **Inline questions**: when Claude needs you to pick between options, the choices arrive as Telegram inline buttons — tap one and the answer goes back to Claude as your next turn. Multi-select questions (`"multi": true`) render as a native non-anonymous poll instead. (Under the hood a system prompt teaches Claude to end such replies with a `TGQUESTION: {...}` JSON marker; the bot strips it and renders 2–6 options. Button payloads live in an in-memory cache, so they expire on bot restart.)
 - **File buttons**: workspace files mentioned in a reply get "📎" download buttons, no manual `/get` needed.
 - **Copy buttons**: short fenced code blocks (≤256 chars, Telegram's cap) in a reply get one-tap "📋" copy buttons under the message — native clipboard copy, no long-press selection.
 - **`/status`**: auth state, selected model, active session, current run duration, last-turn cost/duration/tokens, cumulative session cost, bot uptime.
@@ -17,7 +24,7 @@ Telegram bot that wraps the [Claude Code](https://docs.claude.com/en/docs/claude
 - **Transient-error retry**: overloaded/5xx/network errors are retried automatically with backoff before you ever see them.
 - **Emoji reactions**: the bot reacts 👀 to your message when it starts working on it, 👍 when done, 💔 on failure — ambient feedback without extra chat noise.
 - **Reactions as commands**: react to a bot message with 👍 to tell Claude "go ahead", 👎 for "reconsider" (the reacted text is sent back as context), or ❤/🔥/💯 to save that message to `workspace/saved/` as a note. The bot keeps the text of only the last ~30 sent messages in memory — reacting to anything older (or sent before a restart) gets a "too old" response.
-- **Image generation**: `/img <prompt>` generates an image via OpenAI (`gpt-image-1` by default, `IMAGE_MODEL` to change) and sends it as a photo.
+- **Image generation**: `/img [n] <prompt>` generates an image via OpenAI (`gpt-image-1` by default, `IMAGE_MODEL` to change); `n` = 2–4 variants sent together as an album.
 - **`/export`**: downloads the current session's transcript as a markdown file (user/assistant turns plus tool-use markers).
 - **`/logs [n]`**: last n bot log lines (default 50, max 400) from an in-memory ring buffer; long output is sent as a `bot.log` file.
 - **MarkdownV2 rendering**: Claude's markdown output is auto-escaped to Telegram-safe MarkdownV2 (bold, italic, code, links, code blocks).
@@ -172,9 +179,10 @@ sudo apt-get install -y postgresql-client redis-tools
 | `/session [name]` | list named sessions (buttons) / switch or create one |
 | `/session del <name>` | delete a named session |
 | `/cancel` | kill the current Claude run (queued messages still run) |
-| `/status` | auth, model, session, running state, costs |
+| `/status [pin\|unpin]` | auth, model, session, running state, costs; `pin` keeps a self-updating card pinned |
+| `/quick [add\|rm\|hide]` | persistent reply keyboard with your recurring prompts |
 | `/logs [n]` | last n bot log lines (default 50, max 400) |
-| `/img <prompt>` | generate an image via OpenAI (needs `OPENAI_API_KEY`) |
+| `/img [n] <prompt>` | generate image(s) via OpenAI, n = 2-4 variants as an album (needs `OPENAI_API_KEY`) |
 | `/model [name]` | show or set the Claude model (`default`, `sonnet`, `opus`, `haiku`) |
 | `/export` | download the session transcript as markdown |
 | `/compact` | compact context: summarize the session, then restart it seeded with the summary |

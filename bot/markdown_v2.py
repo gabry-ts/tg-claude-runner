@@ -99,6 +99,18 @@ def to_telegram_markdown(text: str) -> str:
         flags=re.MULTILINE,
     )
 
+    # 7.5 Blockquotes: consecutive '>' lines become a MarkdownV2 quote; more
+    # than 3 lines renders collapsed (expandable) to keep the chat tidy.
+    def _repl_quote(m: re.Match) -> str:
+        lines = [re.sub(r'^>\s?', '', l) for l in m.group(0).split('\n')]
+        escaped = [_escape_special(l) for l in lines]
+        body = '>' + '\n>'.join(escaped)
+        if len(escaped) > 3:
+            body = '**' + body + '||'
+        return store(body)
+
+    text = re.sub(r'(?m)^>.*(?:\n>.*)*', _repl_quote, text)
+
     # 8. Escape the remainder, leaving tokens intact
     parts = _SPLIT_RE.split(text)
     out = []

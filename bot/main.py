@@ -21,7 +21,10 @@ from telegram import (
     CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     ReactionTypeEmoji,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application,
@@ -29,6 +32,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     MessageReactionHandler,
+    PollAnswerHandler,
     filters,
     ContextTypes,
 )
@@ -79,6 +83,12 @@ CLAUDE_CREDS = CLAUDE_HOME / ".credentials.json"
 JOBS_FILE = DATA_DIR / "jobs.json"
 MODEL_FILE = DATA_DIR / "model.json"
 CHAT_FILE = DATA_DIR / "chat.json"
+QUICK_FILE = DATA_DIR / "quick.json"
+PIN_FILE = DATA_DIR / "pinned.json"
+# Telegram message-effect id for 🎉 (private chats only); used on replies to
+# runs longer than LONG_RUN_S together with a big 👍 reaction.
+EFFECT_TADA_ID = "5046509860389126442"
+LONG_RUN_S = 300
 # (label shown on the Telegram button, value passed to `claude --model`).
 # Aliases track the latest version; full IDs pin one. Free text via
 # `/model <name>` is also accepted for anything not listed.
@@ -134,7 +144,12 @@ _TGQ_SYSTEM_PROMPT = (
     "line in exactly this format (valid JSON, last line, nothing after it):\n"
     'TGQUESTION: {"question": "<short question>", "options": ["<opt 1>", "<opt 2>"]}\n'
     "Use 2-6 short options (max 60 chars each), only when a choice is "
-    "genuinely needed. Open-ended questions stay normal text."
+    'genuinely needed. Add "multi": true when the user may pick several '
+    "options (rendered as a Telegram poll). Open-ended questions stay "
+    "normal text.\n"
+    "Formatting: put long log/output dumps in markdown blockquote lines "
+    "(> ...) — they render as a collapsed, expandable quote. Short runnable "
+    "commands go in fenced code blocks (they get one-tap copy buttons)."
 )
 
 # Gives Claude a way to take initiative: anything dropped into the notify
@@ -144,7 +159,10 @@ _PROACTIVE_PROMPT = (
     "current conversation (from a background process, a cron job, or a script "
     f"you set up), write a small text/markdown file into {WORKSPACE_DIR}/.notify/ "
     "— the bot delivers its content to the user within seconds and deletes "
-    "the file."
+    "the file. For an actionable notification, write JSON instead: "
+    '{"text": "<optional message>", "question": "<question>", '
+    '"options": ["<opt>", ...], "multi": false} — the user answers via '
+    "buttons (or a poll if multi) and the answer reaches you as a new turn."
 )
 
 _SYSTEM_APPENDIX = _TGQ_SYSTEM_PROMPT + "\n\n" + _PROACTIVE_PROMPT
@@ -246,9 +264,9 @@ class ClaudeRunner:
             return False
         return sess.cancel_current()
 
-    async def reset(self, uid: int) -> None:
+    async def reset(self, uid: int, name: str | None = None) -> None:
         async with self._locks[uid]:
-            sess = self._sessions.get(self._current)
+            sess = self._sessions.get(name or self._current)
             if sess is not None:
                 await sess.reset()
 
@@ -258,21 +276,25 @@ class ClaudeRunner:
         text: str,
         on_tool_use: ToolUseCallback | None = None,
         on_text=None,
+        session: str | None = None,
     ) -> str:
+        """Run a turn on `session` (default: the current one) — forum topics
+        pass their own session name so topics never touch the global current."""
         async with self._locks[uid]:
             self._busy_since = time.time()
             try:
+                name = session or self._current
                 wanted = self._wanted_model()
-                sess = self._get_session(self._current)
+                sess = self._get_session(name)
                 if sess.model != wanted:
                     log.info(
                         "model switched %s -> %s; resetting session %s",
-                        sess.model, wanted, self._current,
+                        sess.model, wanted, name,
                     )
                     await sess.reset()
                     sess.set_model(wanted)
 
-                log.info("ask[%s]: %s", self._current, text[:200])
+                log.info("ask[%s]: %s", name, text[:200])
                 return await sess.ask(
                     text, on_tool_use=on_tool_use, on_text=on_text
                 )
@@ -508,7 +530,11 @@ def _extract_tgquestion(text: str) -> tuple[str, dict | None]:
     if not question or not (2 <= len(options) <= 6):
         return text, None
     stripped = (text[: m.start()] + text[m.end():]).strip()
-    return stripped, {"question": question, "options": options}
+    return stripped, {
+        "question": question,
+        "options": options,
+        "multi": bool(parsed.get("multi")),
+    }
 
 
 def _mentioned_files(text: str) -> list[Path]:
@@ -569,7 +595,13 @@ def _copy_keyboard(text: str) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-async def send_md(bot, chat_id: int, text: str) -> None:
+async def send_md(
+    bot,
+    chat_id: int,
+    text: str,
+    thread_id: int | None = None,
+    effect_id: str | None = None,
+) -> None:
     """Send text as MarkdownV2, falling back to plain per chunk.
 
     The original text is split first and each chunk converted independently,
@@ -579,7 +611,9 @@ async def send_md(bot, chat_id: int, text: str) -> None:
     a chunk that still overflows after conversion is sent plain.
 
     Short fenced code blocks get one-tap copy buttons attached to the last
-    chunk (native CopyTextButton — no callback round-trip).
+    chunk (native CopyTextButton — no callback round-trip). `thread_id`
+    routes into a forum topic; `effect_id` plays a message effect on the
+    first chunk (private chats only — silently retried without on failure).
     """
     if not text:
         text = "(no response)"
@@ -587,22 +621,36 @@ async def send_md(bot, chat_id: int, text: str) -> None:
     keyboard = _copy_keyboard(text)
     for i, chunk in enumerate(chunks):
         markup = keyboard if i == len(chunks) - 1 else None
+        effect = effect_id if i == 0 and chat_id > 0 else None
         converted = to_telegram_markdown(chunk)
+        payloads = []
         if len(converted) <= 4000:
+            payloads.append({"text": converted, "parse_mode": "MarkdownV2"})
+        payloads.append({"text": chunk})
+        sent = None
+        last_exc: Exception | None = None
+        for payload in payloads:
+            kwargs = {
+                "chat_id": chat_id,
+                "disable_web_page_preview": True,
+                "reply_markup": markup,
+                "message_thread_id": thread_id,
+                **payload,
+            }
+            if effect:
+                kwargs["message_effect_id"] = effect
             try:
-                msg = await bot.send_message(
-                    chat_id=chat_id,
-                    text=converted,
-                    parse_mode="MarkdownV2",
-                    disable_web_page_preview=True,
-                    reply_markup=markup,
-                )
-                _remember_sent(msg.message_id, chunk)
-                continue
+                sent = await bot.send_message(**kwargs)
+                break
             except Exception as e:
-                log.warning("MarkdownV2 send failed (%s); falling back to plain", e)
-        msg = await bot.send_message(chat_id=chat_id, text=chunk, reply_markup=markup)
-        _remember_sent(msg.message_id, chunk)
+                last_exc = e
+                log.warning("send failed (%s); falling back", e)
+                effect = None  # an invalid effect id must not kill the send
+        if sent is None:
+            # every variant failed — callers (e.g. the notify inbox) need to
+            # know delivery did not happen
+            raise last_exc if last_exc else RuntimeError("send failed")
+        _remember_sent(sent.message_id, chunk)
 
 
 async def reply_md(update: Update, text: str) -> None:
@@ -637,8 +685,15 @@ def _format_tool(tu: ToolUse) -> str:
     return f"🔧 {name}"
 
 
-async def _react(bot, chat_id: int, message_id: int | None, emoji: str | None) -> None:
-    """Best-effort reaction on the user's message (👀 working, 👍 done, 💔 error)."""
+async def _react(
+    bot,
+    chat_id: int,
+    message_id: int | None,
+    emoji: str | None,
+    is_big: bool = False,
+) -> None:
+    """Best-effort reaction on the user's message (👀 working, 👍 done, 💔
+    error); is_big plays the enlarged animation (long-run celebration)."""
     if message_id is None:
         return
     try:
@@ -646,13 +701,20 @@ async def _react(bot, chat_id: int, message_id: int | None, emoji: str | None) -
             chat_id=chat_id,
             message_id=message_id,
             reaction=[ReactionTypeEmoji(emoji)] if emoji else [],
+            is_big=is_big or None,
         )
     except Exception as e:
         log.debug("reaction failed: %s", e)
 
 
 async def run_claude_turn(
-    bot, chat_id: int, uid: int, prompt: str, react_to: int | None = None
+    bot,
+    chat_id: int,
+    uid: int,
+    prompt: str,
+    react_to: int | None = None,
+    thread_id: int | None = None,
+    session: str | None = None,
 ) -> str | None:
     """Run one Claude turn, streaming progress into a status message.
 
@@ -660,17 +722,23 @@ async def run_claude_turn(
     plain text) and the latest tool-use label; edits are throttled to one per
     1.5s to stay under Telegram's edit rate limit. When Claude returns, the
     status is deleted and the full reply is sent via send_md(), followed by
-    download buttons for any workspace files it mentions and inline-keyboard
-    rendering of a trailing TGQUESTION marker.
+    download buttons for any workspace files it mentions and a trailing
+    TGQUESTION rendered as inline buttons (or a native poll when multi).
+    `thread_id` keeps everything inside a forum topic; `session` runs the
+    turn on a specific named session (topics map to their own).
     """
+    started = time.monotonic()
     await _react(bot, chat_id, react_to, "👀")
     if claude.busy(uid):
         status = await bot.send_message(
             chat_id=chat_id,
             text="📥 Queued — Claude is still working on the previous message…",
+            message_thread_id=thread_id,
         )
     else:
-        status = await bot.send_message(chat_id=chat_id, text="🤔 thinking…")
+        status = await bot.send_message(
+            chat_id=chat_id, text="🤔 thinking…", message_thread_id=thread_id
+        )
     state = {"last_edit": 0.0, "text": "", "tool": ""}
 
     async def _refresh() -> None:
@@ -699,8 +767,11 @@ async def run_claude_turn(
         state["tool"] = ""
         await _refresh()
 
+    ask_kwargs = {"on_tool_use": on_tool, "on_text": on_text}
+    if session:
+        ask_kwargs["session"] = session
     try:
-        resp = await claude.ask(uid, prompt, on_tool_use=on_tool, on_text=on_text)
+        resp = await claude.ask(uid, prompt, **ask_kwargs)
     except ClaudeSessionError as e:
         log.error("claude turn: session error: %s", e)
         await _react(bot, chat_id, react_to, "💔")
@@ -723,9 +794,16 @@ async def run_claude_turn(
     except Exception:
         pass
 
+    long_run = time.monotonic() - started > LONG_RUN_S
     resp, tgq = _extract_tgquestion(resp)
     if resp or not tgq:
-        await send_md(bot, chat_id, resp)
+        await send_md(
+            bot,
+            chat_id,
+            resp,
+            thread_id=thread_id,
+            effect_id=EFFECT_TADA_ID if long_run else None,
+        )
 
     files = _mentioned_files(resp)
     if files:
@@ -740,31 +818,74 @@ async def run_claude_turn(
             chat_id=chat_id,
             text="Mentioned files:",
             reply_markup=InlineKeyboardMarkup(keyboard),
+            message_thread_id=thread_id,
         )
 
     if tgq:
-        token = _cb_store((tgq["question"], tgq["options"], chat_id, uid))
-        keyboard = [
-            [InlineKeyboardButton(opt, callback_data=f"tgq:{token}:{i}")]
-            for i, opt in enumerate(tgq["options"])
-        ]
-        await bot.send_message(
-            chat_id=chat_id,
-            text="❓ " + tgq["question"],
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        await _send_tgquestion(bot, chat_id, uid, tgq, thread_id)
 
-    await _react(bot, chat_id, react_to, "👍")
+    await _react(bot, chat_id, react_to, "👍", is_big=long_run)
     return resp
 
 
+async def _send_tgquestion(
+    bot, chat_id: int, uid: int, tgq: dict, thread_id: int | None = None
+) -> None:
+    """Render a TGQUESTION: inline buttons for single choice, a native
+    non-anonymous poll for multi-select (answers come back via PollAnswer)."""
+    if tgq.get("multi"):
+        try:
+            msg = await bot.send_poll(
+                chat_id=chat_id,
+                question=tgq["question"][:300],
+                options=[o[:100] for o in tgq["options"]],
+                is_anonymous=False,
+                allows_multiple_answers=True,
+                message_thread_id=thread_id,
+            )
+            _CB_CACHE[msg.poll.id] = (
+                "poll", tgq["question"], tgq["options"], chat_id, uid,
+                thread_id, msg.message_id,
+            )
+            return
+        except Exception as e:
+            log.warning("poll send failed (%s); falling back to buttons", e)
+    token = _cb_store((tgq["question"], tgq["options"], chat_id, uid, thread_id))
+    keyboard = [
+        [InlineKeyboardButton(opt, callback_data=f"tgq:{token}:{i}")]
+        for i, opt in enumerate(tgq["options"])
+    ]
+    await bot.send_message(
+        chat_id=chat_id,
+        text="❓ " + tgq["question"],
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        message_thread_id=thread_id,
+    )
+
+
+def _topic_info(update: Update) -> tuple[int | None, str | None]:
+    """(thread_id, session_name) for forum-topic messages, (None, None)
+    elsewhere. Each topic gets its own deterministic named session, so a
+    forum group gives you one Claude conversation per topic for free."""
+    msg = update.effective_message
+    if msg is None or not getattr(msg, "is_topic_message", False):
+        return None, None
+    thread_id = getattr(msg, "message_thread_id", None)
+    if not thread_id:
+        return None, None
+    return thread_id, f"topic-{thread_id}"
+
+
 async def claude_reply(update: Update, prompt: str) -> str | None:
+    thread_id, session = _topic_info(update)
     return await run_claude_turn(
         update.get_bot(),
         update.effective_chat.id,
         update.effective_user.id,
         prompt,
         react_to=update.message.message_id if update.message else None,
+        thread_id=thread_id,
+        session=session,
     )
 
 
@@ -795,8 +916,41 @@ async def check_notify(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             log.warning("notify read failed for %s: %s", path.name, e)
             continue
+        # A JSON payload with options becomes an actionable notification:
+        # the answer flows back to Claude like a TGQUESTION reply.
+        payload = None
+        if text.startswith("{"):
+            try:
+                data = json.loads(text)
+                if isinstance(data, dict) and isinstance(data.get("options"), list):
+                    payload = data
+            except Exception:
+                payload = None
         try:
-            if text:
+            if payload is not None:
+                body = str(payload.get("text") or "").strip()
+                question = str(payload.get("question") or "").strip()
+                options = [
+                    str(o).strip()[:60]
+                    for o in payload["options"]
+                    if str(o).strip()
+                ]
+                if body:
+                    await send_md(ctx.bot, chat_id, "🔔 " + body)
+                if question and 2 <= len(options) <= 6:
+                    await _send_tgquestion(
+                        ctx.bot,
+                        chat_id,
+                        ALLOWED_USER,
+                        {
+                            "question": question,
+                            "options": options,
+                            "multi": bool(payload.get("multi")),
+                        },
+                    )
+                elif not body:
+                    await send_md(ctx.bot, chat_id, "🔔 " + text)
+            elif text:
                 await send_md(ctx.bot, chat_id, "🔔 " + text)
             path.unlink()
         except Exception as e:
@@ -824,16 +978,20 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/session [name|del name] - list/switch/create/delete named sessions\n"
         "/cancel - kill the current Claude run\n"
         "/compact - compact context\n"
-        "/status - session, running state, costs\n"
+        "/status [pin|unpin] - status; pin keeps a live card pinned\n"
+        "/quick [add|rm|hide] - persistent keyboard with your prompts\n"
         "/logs [n] - last n bot log lines\n"
         "/auth - check Claude auth status\n"
         "/login - paste Claude credentials\n"
         "/file <query> - retrieve files matching a query (Claude searches)\n"
         "/get <path> - send a workspace file by path (no Claude)\n"
-        "/img <prompt> - generate an image (OpenAI)\n"
+        "/img [n] <prompt> - generate image(s), n=2-4 as album (OpenAI)\n"
         "/export - download the session transcript\n"
         "/model [name] - show or set Claude model\n"
         "React to my messages: 👍 go ahead, 👎 reconsider, ❤/🔥/💯 save to workspace/saved/\n"
+        "Reply (or quote-reply) to any message to give Claude that exact context\n"
+        "Edit a sent prompt to get a one-tap re-run with the corrected text\n"
+        "In a forum group, each topic is its own session\n"
         '/schedule add "<cron>" [model=<m>] <prompt> - recurring prompt\n'
         "/schedule list - list jobs\n"
         "/schedule remove <id> - remove job\n"
@@ -970,6 +1128,84 @@ async def cmd_compact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await status.edit_text("Context compacted into a fresh session.")
 
 
+def _load_quick() -> list[str]:
+    try:
+        items = json.loads(QUICK_FILE.read_text())
+        return [str(i)[:40] for i in items if str(i).strip()][:12]
+    except Exception:
+        return []
+
+
+def _save_quick(items: list[str]) -> None:
+    QUICK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    QUICK_FILE.write_text(json.dumps(items, ensure_ascii=False))
+
+
+def _quick_keyboard() -> ReplyKeyboardMarkup | None:
+    items = _load_quick()
+    if not items:
+        return None
+    rows = [items[i:i + 2] for i in range(0, len(items), 2)]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+async def cmd_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Persistent reply keyboard with the user's recurring prompts.
+
+    Tapping a button just sends its text, which flows to Claude like any
+    typed message — zero extra plumbing."""
+    if not allowed(update):
+        return
+    args = ctx.args or []
+    if args and args[0] == "add":
+        text = " ".join(args[1:]).strip()[:40]
+        if not text:
+            await update.message.reply_text("Usage: /quick add <prompt>")
+            return
+        items = _load_quick()
+        if text in items:
+            await update.message.reply_text("Already on the keyboard.")
+            return
+        if len(items) >= 12:
+            await update.message.reply_text("Keyboard full (12 max). /quick rm <n> first.")
+            return
+        items.append(text)
+        _save_quick(items)
+        await update.message.reply_text(
+            f"Added. ({len(items)}/12)", reply_markup=_quick_keyboard()
+        )
+        return
+    if args and args[0] == "rm":
+        items = _load_quick()
+        try:
+            idx = int(args[1]) - 1
+            removed = items.pop(idx)
+        except (IndexError, ValueError):
+            await update.message.reply_text("Usage: /quick rm <number> (see /quick)")
+            return
+        _save_quick(items)
+        markup = _quick_keyboard() or ReplyKeyboardRemove()
+        await update.message.reply_text(f"Removed: {removed}", reply_markup=markup)
+        return
+    if args and args[0] == "hide":
+        await update.message.reply_text(
+            "Keyboard hidden. /quick to bring it back.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    items = _load_quick()
+    if not items:
+        await update.message.reply_text(
+            "No quick prompts yet. Add one with: /quick add <prompt>"
+        )
+        return
+    listing = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(items))
+    await update.message.reply_text(
+        f"Quick prompts:\n{listing}\n\n/quick add <prompt> · /quick rm <n> · /quick hide",
+        reply_markup=_quick_keyboard(),
+    )
+
+
 BOT_STARTED = time.time()
 
 
@@ -982,9 +1218,7 @@ def _fmt_secs(s: float) -> str:
     return f"{s // 3600}h {(s % 3600) // 60}m"
 
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not allowed(update):
-        return
+def _status_text() -> str:
     info = claude.status_info()
     lines = [
         f"Auth: {'✅' if is_authed() else '❌ — use /login'}",
@@ -1013,7 +1247,76 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             lines.append("Last turn: " + ", ".join(parts))
     lines.append(f"Session cost: ${info['total_cost_usd']:.4f}")
     lines.append(f"Bot uptime: {_fmt_secs(time.time() - BOT_STARTED)}")
-    await update.message.reply_text("\n".join(lines))
+    return "\n".join(lines)
+
+
+def _load_pin() -> dict | None:
+    try:
+        data = json.loads(PIN_FILE.read_text())
+        return data if isinstance(data, dict) and "message_id" in data else None
+    except Exception:
+        return None
+
+
+_last_pin_text = {"text": ""}
+
+
+async def update_pinned(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Keep the pinned status card fresh (JobQueue, every 30s)."""
+    pin = _load_pin()
+    if pin is None:
+        return
+    text = "📌 " + _status_text()
+    if text == _last_pin_text["text"]:
+        return
+    try:
+        await ctx.bot.edit_message_text(
+            chat_id=pin["chat_id"], message_id=pin["message_id"], text=text
+        )
+        _last_pin_text["text"] = text
+    except Exception as e:
+        log.debug("pinned status update failed: %s", e)
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    args = ctx.args or []
+    if args and args[0] == "pin":
+        msg = await update.message.reply_text("📌 " + _status_text())
+        try:
+            await ctx.bot.pin_chat_message(
+                chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+                disable_notification=True,
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Could not pin: {e}")
+            return
+        PIN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PIN_FILE.write_text(json.dumps(
+            {"chat_id": update.effective_chat.id, "message_id": msg.message_id}
+        ))
+        _last_pin_text["text"] = ""
+        return
+    if args and args[0] == "unpin":
+        pin = _load_pin()
+        if pin:
+            try:
+                await ctx.bot.unpin_chat_message(
+                    chat_id=pin["chat_id"], message_id=pin["message_id"]
+                )
+            except Exception as e:
+                log.debug("unpin failed: %s", e)
+            try:
+                PIN_FILE.unlink()
+            except OSError:
+                pass
+            await update.message.reply_text("Status unpinned.")
+        else:
+            await update.message.reply_text("Nothing pinned.")
+        return
+    await update.message.reply_text(_status_text())
 
 
 async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1104,7 +1407,7 @@ async def on_tgq_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     if not isinstance(payload, tuple):
         await query.answer("Expired — type your answer instead.")
         return
-    question, options, chat_id, uid = payload
+    question, options, chat_id, uid, thread_id = payload
     if not 0 <= idx < len(options):
         await query.answer("Bad option.")
         return
@@ -1114,7 +1417,32 @@ async def on_tgq_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text(f"❓ {question}\n➡️ {choice}")
     except Exception:
         pass
-    await run_claude_turn(ctx.bot, chat_id, uid, choice)
+    await run_claude_turn(ctx.bot, chat_id, uid, choice, thread_id=thread_id)
+
+
+async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Multi-select TGQUESTION answers come back as PollAnswer updates."""
+    ans = update.poll_answer
+    if ans is None or ans.user is None or ans.user.id != ALLOWED_USER:
+        return
+    payload = _CB_CACHE.pop(ans.poll_id, None)
+    if not (isinstance(payload, tuple) and payload and payload[0] == "poll"):
+        return
+    _, question, options, chat_id, uid, thread_id, message_id = payload
+    chosen = [options[i] for i in ans.option_ids if 0 <= i < len(options)]
+    if not chosen:
+        return
+    try:
+        await ctx.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        log.debug("stop_poll failed: %s", e)
+    await run_claude_turn(
+        ctx.bot,
+        chat_id,
+        uid,
+        f'Answer to "{question}": {", ".join(chosen)}',
+        thread_id=thread_id,
+    )
 
 
 async def on_model_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1306,6 +1634,8 @@ def _safe_filename(name: str) -> str:
 async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
+    if update.message is None:
+        return
     _save_chat_id(update.effective_chat.id)
     msg = update.message
 
@@ -1411,6 +1741,8 @@ async def _tts(text: str) -> bytes:
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
+    if update.message is None:
+        return
     _save_chat_id(update.effective_chat.id)
     voice = update.message.voice or update.message.audio
     if not voice:
@@ -1466,8 +1798,41 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
+def _with_reply_context(msg, text: str) -> str:
+    """Prepend the replied-to (or precisely quoted) text as explicit context.
+
+    Telegram lets the user quote a *part* of a message when replying — that
+    slice beats the whole message for precision. For plain replies, prefer
+    our sent-text cache (bot messages) and fall back to the message's own
+    text/caption. Topic messages are technically replies to the topic
+    service message — those don't count."""
+    quoted = None
+    quote = getattr(msg, "quote", None)
+    if quote is not None and getattr(quote, "text", None):
+        quoted = quote.text
+    else:
+        replied = getattr(msg, "reply_to_message", None)
+        if replied is not None and getattr(replied, "forum_topic_created", None):
+            replied = None
+        if replied is not None:
+            quoted = (
+                _SENT_CACHE.get(replied.message_id)
+                or getattr(replied, "text", None)
+                or getattr(replied, "caption", None)
+            )
+    if not quoted:
+        return text
+    quoted = quoted.strip()[:1000]
+    return (
+        "[The user is replying to this earlier message:]\n"
+        f'"""\n{quoted}\n"""\n\n{text}'
+    )
+
+
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
+        return
+    if update.message is None or update.message.text is None:
         return
     _save_chat_id(update.effective_chat.id)
     text = update.message.text.strip()
@@ -1496,7 +1861,60 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Claude not authenticated. Use /login.")
         return
 
-    await claude_reply(update, text)
+    await claude_reply(update, _with_reply_context(update.message, text))
+
+
+async def on_edited(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """The user fixed a typo in an already-sent prompt: offer a one-tap
+    re-run with the corrected text instead of silently ignoring the edit."""
+    msg = update.edited_message
+    if (
+        msg is None
+        or update.effective_user is None
+        or update.effective_user.id != ALLOWED_USER
+    ):
+        return
+    text = (msg.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+    thread_id, session = _topic_info(update)
+    token = _cb_store(
+        ("rerun", text, msg.chat_id, update.effective_user.id, thread_id, session)
+    )
+    await msg.reply_text(
+        "✏️ Message edited — re-run with the corrected text?",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔁 Re-run", callback_data=f"rerun:{token}")]]
+        ),
+    )
+
+
+async def on_rerun_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    if update.effective_user is None or update.effective_user.id != ALLOWED_USER:
+        await query.answer("Not authorized.")
+        return
+    token = query.data.split(":", 1)[1]
+    payload = _CB_CACHE.pop(token, None)
+    if not (isinstance(payload, tuple) and payload and payload[0] == "rerun"):
+        await query.answer("Expired.")
+        return
+    _, text, chat_id, uid, thread_id, session = payload
+    await query.answer()
+    try:
+        await query.edit_message_text("🔁 Re-running with the corrected text…")
+    except Exception:
+        pass
+    await run_claude_turn(
+        ctx.bot,
+        chat_id,
+        uid,
+        "(corrected message) " + text,
+        thread_id=thread_id,
+        session=session,
+    )
 
 
 def _transcript_markdown(sid: str) -> str | None:
@@ -1561,22 +1979,40 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_document(buf, filename=buf.name)
 
 
-async def _gen_image(prompt: str) -> bytes | str:
+async def _gen_images(prompt: str, n: int = 1) -> list:
     loop = asyncio.get_running_loop()
 
-    def _run() -> bytes | str:
-        params = {"model": IMAGE_MODEL, "prompt": prompt, "size": "1024x1024", "n": 1}
-        # dall-e models return a URL unless asked for b64; gpt-image-1 is
-        # always b64 and rejects the response_format param.
-        if IMAGE_MODEL.startswith("dall-e"):
-            params["response_format"] = "b64_json"
-        resp = _openai_client.images.generate(**params)
-        data = resp.data[0]
+    def _decode(data) -> bytes | str:
         if getattr(data, "b64_json", None):
             return base64.b64decode(data.b64_json)
         return data.url
 
+    def _run() -> list:
+        # dall-e models return a URL unless asked for b64 and only accept
+        # n=1; gpt-image-1 is always b64, rejects response_format, and
+        # generates n variants in one call.
+        if IMAGE_MODEL.startswith("dall-e"):
+            out = []
+            for _ in range(n):
+                resp = _openai_client.images.generate(
+                    model=IMAGE_MODEL,
+                    prompt=prompt,
+                    size="1024x1024",
+                    n=1,
+                    response_format="b64_json",
+                )
+                out.append(_decode(resp.data[0]))
+            return out
+        resp = _openai_client.images.generate(
+            model=IMAGE_MODEL, prompt=prompt, size="1024x1024", n=n
+        )
+        return [_decode(d) for d in resp.data]
+
     return await loop.run_in_executor(None, _run)
+
+
+async def _gen_image(prompt: str) -> bytes | str:
+    return (await _gen_images(prompt, 1))[0]
 
 
 async def cmd_img(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1585,13 +2021,21 @@ async def cmd_img(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if _openai_client is None:
         await update.message.reply_text("Image generation needs OPENAI_API_KEY in .env.")
         return
-    if not ctx.args:
-        await update.message.reply_text("Usage: /img <description of the image>")
+    args = list(ctx.args or [])
+    count = 1
+    if args and args[0].isdigit():
+        count = max(1, min(int(args[0]), 4))
+        args = args[1:]
+    prompt = " ".join(args).strip()
+    if not prompt:
+        await update.message.reply_text(
+            "Usage: /img [n] <description>  (n = 2-4 variants, sent as an album)"
+        )
         return
-    prompt = " ".join(ctx.args).strip()
-    status = await update.message.reply_text("🎨 Generating image…")
+    label = "🎨 Generating image…" if count == 1 else f"🎨 Generating {count} images…"
+    status = await update.message.reply_text(label)
     try:
-        img = await _gen_image(prompt)
+        imgs = await _gen_images(prompt, count)
     except Exception as e:
         log.exception("image generation failed")
         try:
@@ -1603,12 +2047,24 @@ async def cmd_img(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await status.delete()
     except Exception:
         pass
-    if isinstance(img, bytes):
-        buf = BytesIO(img)
-        buf.name = "image.png"
-        await update.message.reply_photo(buf, caption=prompt[:1000])
+
+    def _as_media(img, i: int):
+        caption = prompt[:1000] if i == 0 else None
+        if isinstance(img, bytes):
+            buf = BytesIO(img)
+            buf.name = f"image{i}.png"
+            return buf, caption
+        return img, caption
+
+    if len(imgs) == 1:
+        media, caption = _as_media(imgs[0], 0)
+        await update.message.reply_photo(media, caption=caption)
     else:
-        await update.message.reply_photo(img, caption=prompt[:1000])
+        group = [
+            InputMediaPhoto(media, caption=caption)
+            for media, caption in (_as_media(img, i) for i, img in enumerate(imgs))
+        ]
+        await update.message.reply_media_group(group)
 
 
 async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1704,6 +2160,7 @@ async def post_init(app: Application) -> None:
         BotCommand("cancel", "kill the current Claude run"),
         BotCommand("compact", "compact context"),
         BotCommand("status", "session, running state, costs"),
+        BotCommand("quick", "persistent quick-prompt keyboard"),
         BotCommand("logs", "last bot log lines"),
         BotCommand("img", "generate an image (OpenAI)"),
         BotCommand("export", "download the session transcript"),
@@ -1756,6 +2213,8 @@ def main() -> None:
 
     # Claude's proactive-message inbox (see check_notify / _PROACTIVE_PROMPT).
     app.job_queue.run_repeating(check_notify, interval=5, first=10, name="notify-inbox")
+    # Pinned status card refresh (only edits when the text changed).
+    app.job_queue.run_repeating(update_pinned, interval=30, first=15, name="pinned-status")
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -1773,7 +2232,17 @@ def main() -> None:
     app.add_handler(CommandHandler("logs", cmd_logs))
     app.add_handler(CommandHandler("img", cmd_img))
     app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("quick", cmd_quick))
+    app.add_handler(CallbackQueryHandler(on_rerun_callback, pattern=r"^rerun:"))
+    app.add_handler(PollAnswerHandler(on_poll_answer))
     app.add_handler(MessageReactionHandler(on_reaction))
+
+    # Edited text messages get the re-run offer; registered before handle_text
+    # so the generic text handler only sees fresh messages.
+    app.add_handler(MessageHandler(
+        filters.UpdateType.EDITED_MESSAGE & filters.TEXT & ~filters.COMMAND,
+        on_edited,
+    ))
     app.add_handler(CallbackQueryHandler(on_model_callback, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(on_fget_callback, pattern=r"^fget:"))
     app.add_handler(CallbackQueryHandler(on_tgq_callback, pattern=r"^tgq:"))

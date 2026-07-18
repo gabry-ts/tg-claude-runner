@@ -278,7 +278,7 @@ def test_tgquestion_valid():
     text = "Some answer.\n" + _tgq("Which?", ["red", "blue"])
     stripped, tgq = m._extract_tgquestion(text)
     assert stripped == "Some answer."
-    assert tgq == {"question": "Which?", "options": ["red", "blue"]}
+    assert tgq == {"question": "Which?", "options": ["red", "blue"], "multi": False}
 
 
 def test_tgquestion_missing():
@@ -336,7 +336,7 @@ def test_tgquestion_marker_on_own_line_mid_text_still_matches():
     # text, not only at the very end; surrounding text is glued together.
     text = "before\n" + _tgq("Mid?", ["x", "y"]) + "\nafter"
     stripped, tgq = m._extract_tgquestion(text)
-    assert tgq == {"question": "Mid?", "options": ["x", "y"]}
+    assert tgq == {"question": "Mid?", "options": ["x", "y"], "multi": False}
     assert "before" in stripped and "after" in stripped
     assert "TGQUESTION" not in stripped
 
