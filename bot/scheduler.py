@@ -79,7 +79,12 @@ class Scheduler:
             )
         except Exception as e:
             log.exception("Scheduled job %s failed: %s", job_id, e)
-        self._schedule_next(job)
+        # One-shot jobs fire exactly once and then delete themselves; recurring
+        # jobs re-arm for their next cron match.
+        if job.get("once"):
+            self.remove(job_id)
+        else:
+            self._schedule_next(job)
 
     def add(
         self,
@@ -88,6 +93,7 @@ class Scheduler:
         chat_id: int,
         uid: int,
         model: str | None = None,
+        once: bool = False,
     ) -> str:
         try:
             croniter(cron)
@@ -101,6 +107,7 @@ class Scheduler:
             "chat_id": chat_id,
             "uid": uid,
             "model": model,
+            "once": once,
             "created": int(time.time()),
         }
         self._jobs.append(job)

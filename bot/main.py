@@ -962,6 +962,95 @@ async def check_notify(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
 
 
+async def check_schedule(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Register persistent jobs that Claude drops into workspace/.schedule/.
+
+    Each file is a JSON object:
+        {"cron": "<5-field cron>", "prompt": "<text>",
+         "model": <optional>, "once": <optional bool>}
+
+    Mirrors check_notify: polled every few seconds via the JobQueue, so Claude
+    can schedule work that survives sessions AND bot restarts without the user
+    typing /schedule. Bad files are renamed *.failed so they don't loop."""
+    sched_dir = WORKSPACE_DIR / ".schedule"
+    if not sched_dir.is_dir() or scheduler is None:
+        return
+    chat_id = _load_chat_id()
+    if chat_id is None:
+        return  # nobody has talked to the bot yet; leave files for later
+    try:
+        paths = sorted(
+            (p for p in sched_dir.iterdir() if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+        )
+    except OSError as e:
+        log.warning("schedule scan failed: %s", e)
+        return
+    for path in paths:
+        if path.name.startswith(".") or path.suffix == ".failed":
+            continue
+
+        def _fail(reason: str) -> None:
+            log.warning("schedule %s rejected: %s", path.name, reason)
+            try:
+                path.rename(path.with_name(path.name + ".failed"))
+            except Exception:
+                pass
+
+        try:
+            data = json.loads(path.read_text(errors="replace"))
+        except Exception as e:
+            _fail(f"bad JSON: {e}")
+            continue
+        if not isinstance(data, dict):
+            _fail("not a JSON object")
+            continue
+        cron_expr = str(data.get("cron") or "").strip()
+        prompt = str(data.get("prompt") or "").strip()
+        once = bool(data.get("once"))
+        model = data.get("model")
+        if isinstance(model, str):
+            model = model.strip() or None
+            if model and not _MODEL_NAME_RE.match(model):
+                model = None
+        else:
+            model = None
+        if not cron_expr or not prompt:
+            _fail("missing cron or prompt")
+            continue
+        try:
+            job_id = scheduler.add(
+                cron=cron_expr,
+                prompt=prompt,
+                chat_id=chat_id,
+                uid=ALLOWED_USER,
+                model=model,
+                once=once,
+            )
+        except ValueError as e:
+            try:
+                await send_md(ctx.bot, chat_id, f"⚠️ Cron non valido ({cron_expr}): {e}")
+            except Exception:
+                pass
+            _fail(f"invalid cron: {e}")
+            continue
+        try:
+            path.unlink()
+        except Exception:
+            pass
+        kind = "una volta" if once else "ricorrente"
+        suffix = f" [{model}]" if model else ""
+        try:
+            await send_md(
+                ctx.bot,
+                chat_id,
+                f"🗓 Programmato ({kind}) {cron_expr}{suffix} — id {job_id}\n"
+                + prompt[:200],
+            )
+        except Exception as e:
+            log.warning("schedule confirm failed: %s", e)
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
@@ -2251,6 +2340,9 @@ def main() -> None:
 
     # Claude's proactive-message inbox (see check_notify / _PROACTIVE_PROMPT).
     app.job_queue.run_repeating(check_notify, interval=5, first=10, name="notify-inbox")
+    # Claude's self-scheduling inbox (see check_schedule): lets Claude register
+    # persistent jobs by dropping a file, without the user typing /schedule.
+    app.job_queue.run_repeating(check_schedule, interval=5, first=12, name="schedule-inbox")
     # Pinned status card refresh (only edits when the text changed).
     app.job_queue.run_repeating(update_pinned, interval=30, first=15, name="pinned-status")
 
