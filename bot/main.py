@@ -1213,7 +1213,7 @@ async def cmd_compact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
     if not is_authed():
-        await update.message.reply_text("Not authenticated. Use /login.")
+        await update.message.reply_text("Claude not authenticated. Use /login.")
         return
     uid = update.effective_user.id
     status = await update.message.reply_text("📦 Compacting context…")
@@ -1721,7 +1721,7 @@ async def cmd_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not is_authed():
-        await update.message.reply_text("Not authenticated. Use /login.")
+        await update.message.reply_text("Claude not authenticated. Use /login.")
         return
 
     query = " ".join(ctx.args).strip()
@@ -2011,7 +2011,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"(voice) {transcribed}")
 
         if not is_authed():
-            await update.message.reply_text("Not authenticated. Use /login.")
+            await update.message.reply_text("Claude not authenticated. Use /login.")
             return
 
         resp = await claude_reply(update, transcribed)
@@ -2155,7 +2155,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not is_authed():
-        await update.message.reply_text("Not authenticated. Use /login.")
+        await update.message.reply_text("Claude not authenticated. Use /login.")
         return
 
     await claude_reply(update, _with_reply_context(update.message, text))
@@ -2418,7 +2418,7 @@ async def on_reaction(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if "👍" in added or "👎" in added:
         if not is_authed():
             await ctx.bot.send_message(
-                chat_id=chat_id, text="Not authenticated. Use /login."
+                chat_id=chat_id, text="Claude not authenticated. Use /login."
             )
             return
         excerpt = (text or "(message not cached — too old)")[:500]
