@@ -26,6 +26,17 @@ RUN npm install -g @anthropic-ai/claude-code
 # `/login` onboarding survives container recreation like the Claude ones.
 RUN npm install -g opencode-ai
 
+# Browser control: a headless Chromium driven by the Playwright MCP server, so
+# either backend can navigate/click/type on the web. Browsers are installed into
+# a world-readable path (NOT the bind-mounted home) so they survive rebuilds and
+# are usable by the `node` user; the MCP server is installed globally so it
+# starts without a runtime download. The persistent browser profile lives under
+# the bind-mounted home (set in entrypoint), so logins survive container events.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN npm install -g @playwright/mcp@latest \
+    && npx -y playwright@latest install --with-deps chromium \
+    && chmod -R a+rX /opt/ms-playwright
+
 # Allow `node` to run sudo without a password so Claude can `sudo apt-get install …`
 # at runtime. apt-installed packages survive `docker restart` but are wiped on
 # `docker compose down && up` or image rebuild — use /workspace/init.sh for

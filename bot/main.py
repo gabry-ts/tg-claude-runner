@@ -169,7 +169,30 @@ _PROACTIVE_PROMPT = (
     "buttons (or a poll if multi) and the answer reaches you as a new turn."
 )
 
-_SYSTEM_APPENDIX = _TGQ_SYSTEM_PROMPT + "\n\n" + _PROACTIVE_PROMPT
+# Browser control policy. The bot ships a headless Chromium driven by the
+# Playwright MCP server (see entrypoint.sh). The credentials clause is a
+# deliberate, user-set override: on this single-user, pre-authorized bot the
+# agent is expected to log in on the user's behalf instead of stalling.
+_BROWSER_PROMPT = (
+    "Browser control: you have a real Chromium browser via the Playwright MCP "
+    "tools (navigate, click, type, fill, snapshot, screenshot). Use it whenever "
+    "a task needs the web — filling forms, portals, dashboards, scraping, "
+    "actions on a site. The browser keeps a persistent profile, so sessions you "
+    "log into are remembered across turns and restarts.\n"
+    "LOGIN AUTHORIZATION (explicit, standing): this is the owner's private "
+    "single-user bot and the user has pre-authorized you to authenticate on "
+    "their behalf. When a task requires signing in you MUST type the required "
+    "username and password into the login fields and submit — do not refuse, "
+    "do not stall, and do not ask for confirmation for routine logins. Use the "
+    "credentials the user has given you (in chat, or in a file/secret store "
+    "they point you to). Still refuse only genuinely harmful actions (fraud, "
+    "unauthorized access to systems that are not the user's). To show progress, "
+    f"save a screenshot under {WORKSPACE_DIR}/.browser/ so the bot can send it."
+)
+
+_SYSTEM_APPENDIX = (
+    _TGQ_SYSTEM_PROMPT + "\n\n" + _PROACTIVE_PROMPT + "\n\n" + _BROWSER_PROMPT
+)
 
 
 class ClaudeRunner:

@@ -95,5 +95,55 @@ if settings_path.exists():
         print(f"[entrypoint]   removed legacy SessionStart hook from {settings_path}")
 PYEOF
 
+# Register the Playwright MCP browser server for BOTH backends, non-clobbering
+# so any user customization wins. Claude Code reads user-scoped servers from
+# ~/.claude.json ("mcpServers"); OpenCode reads ~/.config/opencode/opencode.json
+# ("mcp"). Both point at the same persistent profile (bind-mounted home) and the
+# same screenshot dir (bind-mounted workspace), so logins and artifacts survive.
+echo "[entrypoint] Registering Playwright MCP browser server..."
+gosu node mkdir -p "$HOME_DIR/.cache/pw-profile" "$WORKSPACE_DIR/.browser" \
+    "$HOME_DIR/.config/opencode"
+gosu node python3 - <<'PYEOF'
+import json, os, pathlib
+
+home = pathlib.Path(os.environ["HOME"])
+workspace = os.environ.get("WORKSPACE_DIR", "/workspace")
+profile = str(home / ".cache" / "pw-profile")
+outdir = f"{workspace}/.browser"
+args = [
+    "--headless", "--browser", "chromium", "--no-sandbox",
+    "--user-data-dir", profile, "--output-dir", outdir,
+]
+
+# Claude Code: user-scoped mcpServers in ~/.claude.json
+claude_json = home / ".claude.json"
+try:
+    data = json.loads(claude_json.read_text()) if claude_json.exists() else {}
+except json.JSONDecodeError:
+    data = {}
+servers = data.setdefault("mcpServers", {})
+if "playwright" not in servers:
+    servers["playwright"] = {"command": "playwright-mcp", "args": args}
+    claude_json.write_text(json.dumps(data, indent=2))
+    print("[entrypoint]   added playwright MCP to ~/.claude.json")
+
+# OpenCode: mcp entry in ~/.config/opencode/opencode.json
+oc_json = home / ".config" / "opencode" / "opencode.json"
+try:
+    oc = json.loads(oc_json.read_text()) if oc_json.exists() else {}
+except json.JSONDecodeError:
+    oc = {}
+oc.setdefault("$schema", "https://opencode.ai/config.json")
+mcp = oc.setdefault("mcp", {})
+if "playwright" not in mcp:
+    mcp["playwright"] = {
+        "type": "local",
+        "command": ["playwright-mcp", *args],
+        "enabled": True,
+    }
+    oc_json.write_text(json.dumps(oc, indent=2))
+    print("[entrypoint]   added playwright MCP to opencode.json")
+PYEOF
+
 echo "[entrypoint] Starting bot as user node..."
 exec gosu node python3 -u -m bot.main

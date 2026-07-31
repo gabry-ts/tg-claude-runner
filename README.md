@@ -111,6 +111,16 @@ Under the hood each turn spawns `opencode run --format json --auto [--session <i
 
 **Note on instructions:** OpenCode reads `AGENTS.md` (not `CLAUDE.md`) from the workspace. The bot injects its own runtime conventions (proactive files, the `TGQUESTION` marker) as a preamble on the first turn of each session; if you rely on a `CLAUDE.md`, mirror the parts you need into `AGENTS.md` for the OpenCode backend.
 
+## Browser control
+
+The container ships a headless **Chromium** driven by the [Playwright MCP](https://github.com/microsoft/playwright-mcp) server, so the agent can navigate, click, type, fill forms and screenshot the web — on **either** backend. It's registered automatically at boot (`entrypoint.sh`) for both Claude Code (`~/.claude.json`) and OpenCode (`~/.config/opencode/opencode.json`), non-clobbering so your own edits win.
+
+- **Persistent profile:** the browser uses `~/.cache/pw-profile` under the bind-mounted home, so sites you log into stay logged in across turns and container recreation.
+- **Screenshots:** the agent saves them under `workspace/.browser/`; mention the path in a reply and the bot adds a 📎 download button.
+- **Chromium** lives in a world-readable image path (`/opt/ms-playwright`), launched with `--no-sandbox` (required inside a container).
+
+**Logins:** this is a single-user, pre-authorized bot, so the agent is instructed to **enter usernames and passwords into login forms itself** when a task needs authentication, using credentials you give it (in chat or a file you point it to) — it won't stall asking for permission on routine logins. It still refuses genuinely harmful actions (fraud, access to systems that aren't yours). Because the agent runs with `--dangerously-skip-permissions` and can drive a browser with your live sessions, treat the container as sensitive: a malicious web page could try to steer it (prompt injection). Keep it on accounts you're comfortable delegating; to disable browser control, remove the `playwright` entry from the two config files.
+
 ## Login flow
 
 **Browser login (default):** `/login` sends you a claude.ai link. Open it, sign in as usual (email + one-time code), approve the authorization, and paste the short code shown back into the chat. The bot exchanges it for tokens (PKCE — it never sees your email/password/code) and writes `/home/node/.claude/.credentials.json` itself. Because this is a fresh OAuth grant, the bot's tokens are independent from your other machines — no refresh-token rotation conflicts. The pasted code message is deleted right away.
