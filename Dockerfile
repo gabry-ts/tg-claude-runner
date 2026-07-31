@@ -21,6 +21,11 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 
 RUN npm install -g @anthropic-ai/claude-code
 
+# OpenCode CLI — the alternative backend (TGCR_BACKEND=opencode). Its
+# credentials live in /home/node/.local/share/opencode/ (bind-mounted home), so
+# `/login` onboarding survives container recreation like the Claude ones.
+RUN npm install -g opencode-ai
+
 # Allow `node` to run sudo without a password so Claude can `sudo apt-get install …`
 # at runtime. apt-installed packages survive `docker restart` but are wiped on
 # `docker compose down && up` or image rebuild — use /workspace/init.sh for

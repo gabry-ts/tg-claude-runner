@@ -40,13 +40,14 @@ from telegram.ext import (
 from .markdown_v2 import to_telegram_markdown, split_for_telegram
 from .scheduler import Scheduler
 from .claude_session import (
-    ClaudeSession,
     ClaudeSessionError,
     ToolUseCallback,
     sessions_in_state,
 )
 from .session_state import load_state, save_state
 from . import oauth
+from . import backend
+from . import opencode_auth
 from . import transcript
 from .transcript import ToolUse
 
@@ -104,7 +105,9 @@ MODEL_CHOICES = [
     ("Haiku 4.5", "claude-haiku-4-5-20251001"),
 ]
 MODEL_VALUES = [v for _, v in MODEL_CHOICES]
-_MODEL_NAME_RE = re.compile(r"^[\w.\-\[\]]{1,64}$")
+# Slash is allowed so OpenCode's provider/model form (e.g. anthropic/claude-...)
+# passes; Claude Code model names never contain one.
+_MODEL_NAME_RE = re.compile(r"^[\w.\-\[\]/]{1,64}$")
 _SESSION_NAME_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -197,10 +200,10 @@ class ClaudeRunner:
         m = load_model()
         return None if m == "default" else m
 
-    def _get_session(self, name: str) -> ClaudeSession:
+    def _get_session(self, name: str):
         sess = self._sessions.get(name)
         if sess is None:
-            sess = ClaudeSession(
+            sess = backend.make_session(
                 cwd=WORKSPACE_DIR,
                 model=self._wanted_model(),
                 persist_state=True,
@@ -210,9 +213,22 @@ class ClaudeRunner:
             self._sessions[name] = sess
         return sess
 
+    @staticmethod
+    def _logical_name(state_key: str) -> str | None:
+        """Map a persisted state key back to its logical session name for the
+        active backend, or None if it belongs to the other backend. OpenCode
+        keys are prefixed "opencode:"; Claude keys are the bare name."""
+        if backend.is_opencode():
+            prefix = "opencode:"
+            return state_key[len(prefix):] if state_key.startswith(prefix) else None
+        return None if ":" in state_key else state_key
+
     def session_names(self) -> list[str]:
         names = set(self._sessions) | {self._current, "main"}
-        names |= set(sessions_in_state(load_state()))
+        for key in sessions_in_state(load_state()):
+            logical = self._logical_name(key)
+            if logical:
+                names.add(logical)
         return sorted(names)
 
     def _persist_current(self) -> None:
@@ -229,19 +245,20 @@ class ClaudeRunner:
         async with self._locks[uid]:
             sess = self._sessions.pop(name, None)
             state = load_state()
+            state_key = f"opencode:{name}" if backend.is_opencode() else name
             # A just-switched-to session may have no persisted turns yet but
             # still "exists" from the user's point of view.
             existed = (
                 sess is not None
-                or name in sessions_in_state(state)
+                or state_key in sessions_in_state(state)
                 or name == self._current
             )
             if sess is not None:
                 await sess.reset()  # clears its persisted entry too
             else:
                 sessions = sessions_in_state(state)
-                if name in sessions:
-                    sessions.pop(name)
+                if state_key in sessions:
+                    sessions.pop(state_key)
                     for legacy in ("session_id", "cwd", "model"):
                         state.pop(legacy, None)
                     state["sessions"] = sessions
@@ -320,7 +337,7 @@ class ClaudeRunner:
         `model` overrides the globally selected model (scheduled-job routing).
         """
         wanted = model if model and model != "default" else self._wanted_model()
-        sess = ClaudeSession(
+        sess = backend.make_session(
             cwd=WORKSPACE_DIR,
             model=wanted,
             persist_state=False,
@@ -340,7 +357,14 @@ scheduler: Scheduler | None = None
 
 
 def is_authed() -> bool:
-    """True if credentials exist and are usable.
+    """True if the active backend has usable credentials."""
+    if backend.is_opencode():
+        return opencode_auth.is_authed()
+    return _claude_is_authed()
+
+
+def _claude_is_authed() -> bool:
+    """True if Claude credentials exist and are usable.
 
     ``expiresAt`` only bounds the short-lived access token: when a
     ``refreshToken`` is present the CLI silently renews the access token on
@@ -1071,8 +1095,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/status [pin|unpin] - status; pin keeps a live card pinned\n"
         "/quick [add|rm|hide] - persistent keyboard with your prompts\n"
         "/logs [n] - last n bot log lines\n"
-        "/auth - check Claude auth status\n"
-        "/login - sign in via browser link (or paste credentials JSON)\n"
+        "/auth - check auth status of the active backend\n"
+        "/login - sign in (Claude: browser link; OpenCode: pick provider + paste token)\n"
+        "/backend [claude|opencode] - show or switch the engine\n"
         "/file <query> - retrieve files matching a query (Claude searches)\n"
         "/get <path> - send a workspace file by path (no Claude)\n"
         "/img [n] <prompt> - generate image(s), n=2-4 as album (OpenAI)\n"
@@ -1188,7 +1213,7 @@ async def cmd_compact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
     if not is_authed():
-        await update.message.reply_text("Claude not authenticated. Use /login.")
+        await update.message.reply_text("Not authenticated. Use /login.")
         return
     uid = update.effective_user.id
     status = await update.message.reply_text("📦 Compacting context…")
@@ -1311,6 +1336,7 @@ def _fmt_secs(s: float) -> str:
 def _status_text() -> str:
     info = claude.status_info()
     lines = [
+        f"Backend: {backend.current()}",
         f"Auth: {'✅' if is_authed() else '❌ — use /login'}",
         f"Model: {load_model()}",
         f"Session: {info['session_name']} ({info['session_id'] or 'no id yet'})",
@@ -1412,6 +1438,19 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
+    if backend.is_opencode():
+        provs = opencode_auth.providers()
+        if provs:
+            await update.message.reply_text(
+                "OpenCode è configurato.\nProvider: "
+                + ", ".join(provs)
+                + "\nUsa /login per aggiungerne un altro."
+            )
+        else:
+            await update.message.reply_text(
+                "OpenCode non ha nessun provider configurato. Usa /login."
+            )
+        return
     if is_authed():
         await update.message.reply_text("Claude is authenticated. Use /login to re-auth.")
     else:
@@ -1420,10 +1459,103 @@ async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # One pending browser login at a time (single-user bot).
 _PENDING_LOGIN: dict = {"login": None}
+# Pending OpenCode API-key onboarding: {"provider": <id|None>, "awaiting":
+# "provider"|"token"} — provider chosen via buttons, token pasted as text.
+_PENDING_OC_LOGIN: dict = {"provider": None, "awaiting": None}
+
+
+async def cmd_backend(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    if ctx.args:
+        name = ctx.args[0].strip().lower()
+        if not backend.set_current(name):
+            await update.message.reply_text(
+                "Backend non valido. Scegli: claude oppure opencode."
+            )
+            return
+        await update.message.reply_text(
+            f"Backend impostato su *{name}*. Le sessioni dei due backend sono "
+            "separate; usa /login per configurare le credenziali e /new per "
+            "iniziare una conversazione pulita.",
+            parse_mode="Markdown",
+        )
+        return
+    cur = backend.current()
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'• ' if b == cur else ''}{b}", callback_data=f"backend:{b}",
+        )]
+        for b in backend.VALID
+    ]
+    await update.message.reply_text(
+        f"Backend attivo: *{cur}*\nScegli quale motore usare:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def on_backend_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    name = query.data.split(":", 1)[1]
+    if backend.set_current(name):
+        await query.answer(f"Backend: {name}")
+        await query.edit_message_text(
+            f"Backend impostato su *{name}*. Usa /login per le credenziali e "
+            "/new per una conversazione pulita.",
+            parse_mode="Markdown",
+        )
+    else:
+        await query.answer("Backend non valido", show_alert=True)
+
+
+async def _login_opencode(update: Update) -> None:
+    _PENDING_OC_LOGIN.update({"provider": None, "awaiting": "provider"})
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"oclogin:{pid}")]
+        for label, pid in opencode_auth.COMMON_PROVIDERS
+    ]
+    buttons.append([InlineKeyboardButton("➕ Altro provider…", callback_data="oclogin:__other")])
+    await update.message.reply_text(
+        "🔐 *Configura OpenCode*\n"
+        "Quale provider/abbonamento vuoi usare? Scegline uno, oppure "
+        "\"Altro\" per inserire un id qualsiasi di models.dev.\n"
+        "Dopo ti chiederò il token API.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def on_oclogin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    pid = query.data.split(":", 1)[1]
+    if pid == "__other":
+        _PENDING_OC_LOGIN.update({"provider": None, "awaiting": "provider"})
+        await query.answer()
+        await query.edit_message_text(
+            "Scrivi l'*id* del provider (come su models.dev, es. `mistral`, "
+            "`together`, `azure`).",
+            parse_mode="Markdown",
+        )
+        return
+    _PENDING_OC_LOGIN.update({"provider": pid, "awaiting": "token"})
+    await query.answer()
+    await query.edit_message_text(
+        f"Provider: *{pid}*\nOra incolla qui il *token API*. "
+        "Il messaggio col token verrà cancellato subito.",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_login(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
+        return
+    if backend.is_opencode():
+        await _login_opencode(update)
         return
     login = oauth.new_login()
     _PENDING_LOGIN["login"] = login
@@ -1589,7 +1721,7 @@ async def cmd_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not is_authed():
-        await update.message.reply_text("Claude not authenticated. Use /login.")
+        await update.message.reply_text("Not authenticated. Use /login.")
         return
 
     query = " ".join(ctx.args).strip()
@@ -1879,7 +2011,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"(voice) {transcribed}")
 
         if not is_authed():
-            await update.message.reply_text("Claude not authenticated. Use /login.")
+            await update.message.reply_text("Not authenticated. Use /login.")
             return
 
         resp = await claude_reply(update, transcribed)
@@ -1939,6 +2071,44 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     _save_chat_id(update.effective_chat.id)
     text = update.message.text.strip()
 
+    # Pending OpenCode onboarding: first the provider id (for the "Altro" path),
+    # then the API token, which is written to opencode's auth.json and deleted
+    # from the chat right away.
+    awaiting = _PENDING_OC_LOGIN.get("awaiting")
+    if awaiting == "provider":
+        if not opencode_auth.valid_provider(text):
+            await update.message.reply_text(
+                "Id provider non valido. Riprova con un id di models.dev "
+                "(lettere, cifre, . - _)."
+            )
+            return
+        _PENDING_OC_LOGIN.update({"provider": text.strip().lower(), "awaiting": "token"})
+        await update.message.reply_text(
+            f"Provider: *{text.strip().lower()}*\nOra incolla il *token API*.",
+            parse_mode="Markdown",
+        )
+        return
+    if awaiting == "token":
+        provider = _PENDING_OC_LOGIN.get("provider")
+        try:
+            opencode_auth.save_api_key(provider, text)
+        except Exception as e:
+            await update.message.reply_text(f"Errore nel salvataggio: {e}")
+            return
+        _PENDING_OC_LOGIN.update({"provider": None, "awaiting": None})
+        try:
+            await update.message.delete()
+            note = f"✅ Token salvato per *{provider}*. OpenCode è pronto."
+        except Exception as e:
+            log.warning("could not delete opencode token message: %s", e)
+            note = (
+                f"✅ Token salvato per *{provider}*. OpenCode è pronto.\n"
+                "⚠️ Non sono riuscito a cancellare il messaggio col token: "
+                "rimuovilo a mano."
+            )
+        await update.effective_chat.send_message(note, parse_mode="Markdown")
+        return
+
     # Pending browser login: the pasted authorization code gets exchanged
     # for tokens (see bot/oauth.py). The bot never sees email/password.
     pending = _PENDING_LOGIN.get("login")
@@ -1985,7 +2155,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not is_authed():
-        await update.message.reply_text("Claude not authenticated. Use /login.")
+        await update.message.reply_text("Not authenticated. Use /login.")
         return
 
     await claude_reply(update, _with_reply_context(update.message, text))
@@ -2248,7 +2418,7 @@ async def on_reaction(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if "👍" in added or "👎" in added:
         if not is_authed():
             await ctx.bot.send_message(
-                chat_id=chat_id, text="Claude not authenticated. Use /login."
+                chat_id=chat_id, text="Not authenticated. Use /login."
             )
             return
         excerpt = (text or "(message not cached — too old)")[:500]
@@ -2355,6 +2525,9 @@ def main() -> None:
     app.add_handler(CommandHandler("compact", cmd_compact))
     app.add_handler(CommandHandler("auth", cmd_auth))
     app.add_handler(CommandHandler("login", cmd_login))
+    app.add_handler(CommandHandler("backend", cmd_backend))
+    app.add_handler(CallbackQueryHandler(on_backend_callback, pattern=r"^backend:"))
+    app.add_handler(CallbackQueryHandler(on_oclogin_callback, pattern=r"^oclogin:"))
     app.add_handler(CommandHandler("file", cmd_file))
     app.add_handler(CommandHandler("get", cmd_get))
     app.add_handler(CommandHandler("model", cmd_model))

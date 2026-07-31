@@ -94,6 +94,23 @@ Drop anything into `~/claude_bot/workspace/`. Claude will see it because that's 
 
 The bot's own Python code is in the container at `/app/` and is **not** visible to Claude.
 
+## Backends: Claude Code or OpenCode
+
+The bot can be driven by either **Claude Code** (default) or **[OpenCode](https://opencode.ai)** behind the same Telegram interface. Everything else — sessions, queue, streaming, scheduler, proactive `.notify/`, inline questions — is backend-agnostic and works unchanged.
+
+- **Select the default** with `TGCR_BACKEND=claude|opencode` in `.env`.
+- **Switch at runtime** from Telegram with `/backend` (buttons) or `/backend opencode`. The two backends keep **separate sessions** (OpenCode session ids are namespaced so they never collide with Claude's) and **separate credentials**, so switching back and forth is safe.
+
+**OpenCode is generic over providers.** It's powered by the [models.dev](https://models.dev) provider list, so `/login` on the OpenCode backend asks *which provider/plan you have* and *for your API token*, for any provider:
+
+1. `/login` → pick a provider (OpenCode Zen, Anthropic, OpenAI, OpenRouter, Google, … or "Altro" to type any models.dev provider id)
+2. Paste your API token → it's written to `~/.local/share/opencode/auth.json` (`{"type":"api","key":"…"}`) and your message is deleted right away
+3. `/model provider/model` selects the model (e.g. `anthropic/claude-sonnet-4-6`, `openai/gpt-5`); `/auth` lists configured providers
+
+Under the hood each turn spawns `opencode run --format json --auto [--session <id>] [--model <provider/model>]`, feeding the prompt on stdin and parsing the JSONL event stream (`text`/`tool_use`/`error` events). Credentials live under the bind-mounted home, so they survive container recreation exactly like the Claude ones.
+
+**Note on instructions:** OpenCode reads `AGENTS.md` (not `CLAUDE.md`) from the workspace. The bot injects its own runtime conventions (proactive files, the `TGQUESTION` marker) as a preamble on the first turn of each session; if you rely on a `CLAUDE.md`, mirror the parts you need into `AGENTS.md` for the OpenCode backend.
+
 ## Login flow
 
 **Browser login (default):** `/login` sends you a claude.ai link. Open it, sign in as usual (email + one-time code), approve the authorization, and paste the short code shown back into the chat. The bot exchanges it for tokens (PKCE — it never sees your email/password/code) and writes `/home/node/.claude/.credentials.json` itself. Because this is a fresh OAuth grant, the bot's tokens are independent from your other machines — no refresh-token rotation conflicts. The pasted code message is deleted right away.
