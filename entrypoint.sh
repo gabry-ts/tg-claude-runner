@@ -104,28 +104,38 @@ echo "[entrypoint] Registering Playwright MCP browser server..."
 gosu node mkdir -p "$HOME_DIR/.cache/pw-profile" "$WORKSPACE_DIR/.browser" \
     "$HOME_DIR/.config/opencode"
 gosu node python3 - <<'PYEOF'
-import json, os, pathlib
+import glob, json, os, pathlib
 
 home = pathlib.Path(os.environ["HOME"])
 workspace = os.environ.get("WORKSPACE_DIR", "/workspace")
 profile = str(home / ".cache" / "pw-profile")
 outdir = f"{workspace}/.browser"
-args = [
-    "--headless", "--browser", "chromium", "--no-sandbox",
-    "--user-data-dir", profile, "--output-dir", outdir,
-]
 
-# Claude Code: user-scoped mcpServers in ~/.claude.json
+# @playwright/mcp's --browser flag only accepts chrome/firefox/webkit/msedge —
+# NOT "chromium" — so point it straight at the bundled Chromium via
+# --executable-path. Glob the versioned dir so it self-heals across rebuilds.
+chrome = next(iter(sorted(
+    glob.glob("/opt/ms-playwright/chromium-*/chrome-linux64/chrome")
+)), None)
+args = ["--headless", "--no-sandbox", "--user-data-dir", profile,
+        "--output-dir", outdir]
+if chrome:
+    args += ["--executable-path", chrome]
+
+# This is a bot-managed server: (re)write the "playwright" entry on every boot
+# so a stale/incorrect one self-heals, while leaving any other MCP servers the
+# user configured untouched.
 claude_json = home / ".claude.json"
 try:
     data = json.loads(claude_json.read_text()) if claude_json.exists() else {}
 except json.JSONDecodeError:
     data = {}
 servers = data.setdefault("mcpServers", {})
-if "playwright" not in servers:
-    servers["playwright"] = {"command": "playwright-mcp", "args": args}
+desired = {"command": "playwright-mcp", "args": args}
+if servers.get("playwright") != desired:
+    servers["playwright"] = desired
     claude_json.write_text(json.dumps(data, indent=2))
-    print("[entrypoint]   added playwright MCP to ~/.claude.json")
+    print("[entrypoint]   set playwright MCP in ~/.claude.json")
 
 # OpenCode: mcp entry in ~/.config/opencode/opencode.json
 oc_json = home / ".config" / "opencode" / "opencode.json"
@@ -135,14 +145,11 @@ except json.JSONDecodeError:
     oc = {}
 oc.setdefault("$schema", "https://opencode.ai/config.json")
 mcp = oc.setdefault("mcp", {})
-if "playwright" not in mcp:
-    mcp["playwright"] = {
-        "type": "local",
-        "command": ["playwright-mcp", *args],
-        "enabled": True,
-    }
+oc_desired = {"type": "local", "command": ["playwright-mcp", *args], "enabled": True}
+if mcp.get("playwright") != oc_desired:
+    mcp["playwright"] = oc_desired
     oc_json.write_text(json.dumps(oc, indent=2))
-    print("[entrypoint]   added playwright MCP to opencode.json")
+    print("[entrypoint]   set playwright MCP in opencode.json")
 PYEOF
 
 echo "[entrypoint] Starting bot as user node..."
